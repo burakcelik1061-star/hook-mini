@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
 	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/lock"
 
 	"github.com/burakcelik1061-star/hook-mini/db/migrations"
 )
@@ -55,7 +56,15 @@ func Migrate(ctx context.Context, log *slog.Logger, url string) (int, error) {
 	}
 	defer db.Close()
 
-	provider, err := goose.NewProvider(goose.DialectPostgres, db, migrations.FS)
+	// A Postgres advisory lock makes concurrent migrators take turns: two
+	// replicas starting together must not both try to create the same table.
+	// A waiting migrator polls every second (the library's minimum) for up to
+	// five minutes instead of its 5-second default.
+	locker, err := lock.NewPostgresSessionLocker(lock.WithLockTimeout(1, 300))
+	if err != nil {
+		return 0, fmt.Errorf("create migration locker: %w", err)
+	}
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, migrations.FS, goose.WithSessionLocker(locker))
 	if err != nil {
 		return 0, fmt.Errorf("create migration provider: %w", err)
 	}

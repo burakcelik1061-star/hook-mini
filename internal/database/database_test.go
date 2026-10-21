@@ -2,11 +2,25 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"io"
+	"io/fs"
 	"log/slog"
+	"net/url"
 	"os"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/lock"
+
+	"github.com/burakcelik1061-star/hook-mini/db/migrations"
 )
 
 // These tests need a real Postgres. Point TEST_DATABASE_URL at a throwaway
@@ -55,6 +69,194 @@ func TestConnectAndMigrate(t *testing.T) {
 		`SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'set_updated_at')`).Scan(&exists)
 	if err != nil || !exists {
 		t.Fatalf("baseline function set_updated_at missing (err=%v)", err)
+	}
+}
+
+// scratchDatabase creates an empty database next to TEST_DATABASE_URL's and
+// returns its URL; it is dropped when the test ends.
+func scratchDatabase(ctx context.Context, t *testing.T) string {
+	t.Helper()
+	base := testURL(t)
+
+	admin, err := pgx.Connect(ctx, base)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { _ = admin.Close(context.Background()) })
+
+	name := "hookmini_scratch_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+name); err != nil {
+		t.Fatalf("create scratch database: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = admin.Exec(context.Background(), "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
+	})
+
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Path = "/" + name
+	return u.String()
+}
+
+// TestMigrateWaitsForAdvisoryLock is the deterministic proof that migrators
+// take turns: while another session holds the migration lock, Migrate must
+// block and change nothing; once the lock is released it must proceed.
+func TestMigrateWaitsForAdvisoryLock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	scratch := scratchDatabase(ctx, t)
+
+	holder, err := pgx.Connect(ctx, scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close(context.Background())
+	if _, err := holder.Exec(ctx, "SELECT pg_advisory_lock($1)", lock.DefaultLockID); err != nil {
+		t.Fatalf("take the migration lock: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := Migrate(ctx, quiet(), scratch)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("Migrate finished (err=%v) while another session held the lock", err)
+	case <-time.After(1500 * time.Millisecond):
+	}
+
+	var tables int
+	if err := holder.QueryRow(ctx, `SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename <> 'goose_db_version'`).Scan(&tables); err != nil {
+		t.Fatal(err)
+	}
+	if tables != 0 {
+		t.Fatalf("Migrate changed the schema (%d tables) without holding the lock", tables)
+	}
+
+	if _, err := holder.Exec(ctx, "SELECT pg_advisory_unlock($1)", lock.DefaultLockID); err != nil {
+		t.Fatalf("release the lock: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Migrate after the lock was released: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Migrate did not proceed after the lock was released")
+	}
+}
+
+// TestConcurrentMigratorsAllSucceed is a smoke test: several migrators started
+// together against an empty database must all succeed and apply every
+// migration exactly once between them. The race it guards against is timing
+// dependent, so TestMigrateWaitsForAdvisoryLock is the real proof of the lock.
+func TestConcurrentMigratorsAllSucceed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	scratch := scratchDatabase(ctx, t)
+
+	const migrators = 6
+	var (
+		wg      sync.WaitGroup
+		applied atomic.Int32
+		errs    = make(chan error, migrators)
+	)
+	for range migrators {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			n, err := Migrate(ctx, quiet(), scratch)
+			applied.Add(int32(n))
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Errorf("a concurrent Migrate failed: %v", err)
+		}
+	}
+	// Each migration must have been applied exactly once in total.
+	files, err := fs.Glob(migrations.FS, "*.sql")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("list migrations: %v (%d files)", err, len(files))
+	}
+	if got := int(applied.Load()); got != len(files) {
+		t.Errorf("migrations applied across all migrators = %d, want %d", got, len(files))
+	}
+}
+
+// TestMigrationsRoundTrip proves every migration's Down really undoes its Up:
+// up, all the way down, up again. It runs in a scratch database it creates and
+// drops itself, so it cannot disturb the database the other tests share.
+func TestMigrationsRoundTrip(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	scratch := scratchDatabase(ctx, t)
+
+	db, err := sql.Open("pgx", scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	provider, err := goose.NewProvider(goose.DialectPostgres, db, migrations.FS)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	userTables := func() []string {
+		t.Helper()
+		rows, err := db.QueryContext(ctx, `SELECT tablename FROM pg_tables
+			WHERE schemaname = 'public' AND tablename <> 'goose_db_version' ORDER BY tablename`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var out []string
+		for rows.Next() {
+			var s string
+			if err := rows.Scan(&s); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, s)
+		}
+		return out
+	}
+	functions := func() int {
+		var n int
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+			WHERE n.nspname = 'public'`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	if _, err := provider.Up(ctx); err != nil {
+		t.Fatalf("up: %v", err)
+	}
+	upTables := userTables()
+	if len(upTables) == 0 || functions() == 0 {
+		t.Fatalf("up created no schema: tables=%v", upTables)
+	}
+
+	if _, err := provider.DownTo(ctx, 0); err != nil {
+		t.Fatalf("down to 0: %v", err)
+	}
+	if left := userTables(); len(left) != 0 || functions() != 0 {
+		t.Fatalf("down left objects behind: tables=%v functions=%d", left, functions())
+	}
+
+	if _, err := provider.Up(ctx); err != nil {
+		t.Fatalf("second up: %v", err)
+	}
+	if again := userTables(); !slices.Equal(again, upTables) {
+		t.Fatalf("schema after down+up differs:\n got %v\nwant %v", again, upTables)
 	}
 }
 
