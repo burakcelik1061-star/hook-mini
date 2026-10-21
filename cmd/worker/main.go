@@ -12,6 +12,7 @@ import (
 	"github.com/burakcelik1061-star/hook-mini/internal/delivery"
 	"github.com/burakcelik1061-star/hook-mini/internal/lifecycle"
 	"github.com/burakcelik1061-star/hook-mini/internal/logging"
+	"github.com/burakcelik1061-star/hook-mini/internal/retention"
 )
 
 func main() {
@@ -61,11 +62,24 @@ func run() error {
 		log.Warn("ALLOW_PRIVATE_DESTINATIONS is on: webhooks may be sent to private and loopback addresses; never use this in production")
 	}
 
+	cleaner, err := retention.New(pool, log, retention.Config{Period: cfg.RetentionPeriod, Interval: cfg.CleanupInterval})
+	if err != nil {
+		return err
+	}
+
 	log.Info("worker started",
 		"worker_id", w.ID(), "concurrency", wc.Concurrency, "lease", wc.LeaseDuration,
 		"request_timeout", wc.RequestTimeout, "max_attempts", wc.MaxAttempts)
-	if err := w.Run(ctx); err != nil {
-		return err
+
+	cleaned := make(chan struct{})
+	go func() {
+		defer close(cleaned)
+		cleaner.Run(ctx)
+	}()
+	runErr := w.Run(ctx)
+	<-cleaned // Run returned because ctx ended; the cleaner stops on the same signal
+	if runErr != nil {
+		return runErr
 	}
 	log.Info("worker stopped")
 	return nil

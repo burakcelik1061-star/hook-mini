@@ -33,7 +33,16 @@ type Config struct {
 	AllowPrivateDestinations bool
 	// Worker holds the delivery worker's settings.
 	Worker Worker
+	// RetentionPeriod is how long finished deliveries and events are kept;
+	// zero keeps them forever.
+	RetentionPeriod time.Duration
+	// CleanupInterval is how often the worker deletes what has expired.
+	CleanupInterval time.Duration
 }
+
+// MinRetentionPeriod is the shortest retention period other than zero (off).
+// A typo such as "1s" would otherwise delete everything on the next pass.
+const MinRetentionPeriod = 24 * time.Hour
 
 // Worker configures the delivery worker.
 type Worker struct {
@@ -148,6 +157,12 @@ func Load(getenv func(string) string) (Config, error) {
 		fail("DELIVERY_BACKOFF_MAX (%s) must not be smaller than DELIVERY_BACKOFF_INITIAL (%s)", w.BackoffMax, w.BackoffInitial)
 	}
 	cfg.Worker = w
+
+	cfg.RetentionPeriod = duration("RETENTION_PERIOD", "2160h", 0, 10*365*24*time.Hour)
+	if cfg.RetentionPeriod > 0 && cfg.RetentionPeriod < MinRetentionPeriod {
+		fail("RETENTION_PERIOD (%s) must be 0 (keep forever) or at least %s", cfg.RetentionPeriod, MinRetentionPeriod)
+	}
+	cfg.CleanupInterval = duration("CLEANUP_INTERVAL", "1h", time.Minute, 24*time.Hour)
 
 	if len(errs) > 0 {
 		return Config{}, fmt.Errorf("invalid configuration: %w", errors.Join(errs...))

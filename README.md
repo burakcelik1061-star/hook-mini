@@ -277,6 +277,21 @@ a wait, never shorten it. All times come from the database clock.
   the endpoint, `POST /v1/endpoints/{id}/enable`, and replay them. Replaying
   to a disabled endpoint is refused with `409 endpoint_disabled`.
 
+### Retention
+
+Finished data does not pile up forever. Every worker runs a cleaner (at start
+and every `CLEANUP_INTERVAL`) that deletes, in batches of 1000:
+
+- deliveries that are `succeeded` or `dead` and ended more than
+  `RETENTION_PERIOD` ago (90 days by default), with their attempts;
+- events older than that which no delivery refers to any more.
+
+Deliveries that are pending or in flight are never touched, and an event stays
+as long as any of its deliveries does. Several workers may clean at once: rows
+another one holds are skipped (`FOR UPDATE SKIP LOCKED`), so the cleaner never
+waits behind a worker or a replay. `RETENTION_PERIOD=0` turns it off; any other
+value below 24 hours is refused at startup, so a typo cannot wipe the history.
+
 ## Security
 
 ### Verifying a webhook
@@ -368,6 +383,8 @@ reported together at startup. `.env.example` lists them.
 | `DELIVERY_MAX_ATTEMPTS` | `8` | worker | per round (a replay starts a new round) |
 | `DELIVERY_BACKOFF_INITIAL` / `_MAX` | `30s` / `6h` | worker | retry waits |
 | `ENDPOINT_AUTO_DISABLE_AFTER` | `100` | worker | consecutive failed attempts before an endpoint is disabled; `0` = never |
+| `RETENTION_PERIOD` | `2160h` (90 days) | worker | how long finished deliveries and events are kept; `0` = forever, otherwise at least `24h` |
+| `CLEANUP_INTERVAL` | `1h` | worker | how often expired data is deleted |
 | `RECEIVER_ADDR`, `RECEIVER_SECRETS` | `:9000`, empty | demo receiver | address; secrets to verify signatures with |
 
 ## Operating
@@ -465,7 +482,9 @@ Chosen limits and gaps, so nothing here is a surprise:
   raw value. Encryption at rest (and a key-management story) is not done.
 - **No rate limiting** on the API, and no per-tenant or per-endpoint fairness:
   one tenant sending a flood can occupy the queue.
-- **No retention**: deliveries, attempts and events are kept forever.
+- **Idempotency keys expire with their events.** Finished data is deleted
+  after `RETENTION_PERIOD` (90 days by default), and an event's idempotency
+  key goes with it: after that, the same key creates a new event.
 - **Replay is one delivery at a time**; there is no "replay everything that
   failed for this endpoint" call.
 - **Workers poll** (500 ms by default) instead of using `LISTEN/NOTIFY`.
@@ -499,6 +518,7 @@ tried and what the tests found.
 | [`docs/06-testler.md`](docs/06-testler.md) | Chaos, contention, fuzz; the four bugs they found |
 | [`docs/07-openapi.md`](docs/07-openapi.md) | The OpenAPI document and how it is kept honest |
 | [`docs/08-son-inceleme.md`](docs/08-son-inceleme.md) | Final security and concurrency review: 16 findings, what changed, what the chaos test taught |
+| [`docs/09-saklama-suresi.md`](docs/09-saklama-suresi.md) | Retention: what is deleted, what never is, how it stays safe |
 | [`api/openapi.yaml`](api/openapi.yaml) | The API contract |
 
 ## Roadmap

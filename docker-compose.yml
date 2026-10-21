@@ -63,6 +63,10 @@ services:
       DELIVERY_BACKOFF_MAX: ${DELIVERY_BACKOFF_MAX:-6h}
       DELIVERY_MAX_ATTEMPTS: ${DELIVERY_MAX_ATTEMPTS:-8}
       ENDPOINT_AUTO_DISABLE_AFTER: ${ENDPOINT_AUTO_DISABLE_AFTER:-100}
+      # How long finished deliveries and events are kept (0 = forever, else at
+      # least 24h), and how often the worker deletes what has expired.
+      RETENTION_PERIOD: ${RETENTION_PERIOD:-2160h}
+      CLEANUP_INTERVAL: ${CLEANUP_INTERVAL:-1h}
     depends_on:
       migrate:
         condition: service_completed_successfully

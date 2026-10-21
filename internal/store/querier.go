@@ -65,6 +65,23 @@ type Querier interface {
 	CreateEvent(ctx context.Context, arg CreateEventParams) (Event, error)
 	CreateTenant(ctx context.Context, name string) (Tenant, error)
 	DeleteEndpoint(ctx context.Context, arg DeleteEndpointParams) (int64, error)
+	// Retention: deleting what has outlived its usefulness, a batch at a time.
+	// Both queries are safe to run from several workers at once (FOR UPDATE SKIP
+	// LOCKED), and neither touches a delivery that is still pending or in flight.
+	// Deletes up to batch_size finished deliveries (succeeded or dead) that ended
+	// more than retention_ms ago; their attempts go with them (ON DELETE
+	// CASCADE). The locking SELECT is a MATERIALIZED CTE for the same reason as in
+	// ClaimDueDeliveries. A delivery that a replay has made pending again no
+	// longer matches the status filter and stays; one a replay holds locked right
+	// now is skipped, and a replay that arrives after the delete finds nothing
+	// and is answered 404.
+	DeleteExpiredDeliveries(ctx context.Context, arg DeleteExpiredDeliveriesParams) (int64, error)
+	// Deletes up to batch_size events older than retention_ms that no delivery
+	// refers to any more (their deliveries were deleted, or there were none). An
+	// event that still has a pending, retrying or recent delivery stays, whatever
+	// its age. Deleting the event also deletes its idempotency key, so a key can
+	// be used again once retention has passed.
+	DeleteExpiredEvents(ctx context.Context, arg DeleteExpiredEventsParams) (int64, error)
 	// Cascades to keys, endpoints, events, deliveries and attempts.
 	DeleteTenant(ctx context.Context, id uuid.UUID) (int64, error)
 	// Idempotent: only an active endpoint is changed, so the first reason sticks.

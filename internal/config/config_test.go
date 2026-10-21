@@ -149,6 +149,42 @@ func TestWorkerValidation(t *testing.T) {
 	}
 }
 
+func TestRetentionSettings(t *testing.T) {
+	load := func(extra map[string]string) (Config, error) {
+		e := map[string]string{"DATABASE_URL": "postgres://u:p@db/x"}
+		for k, v := range extra {
+			e[k] = v
+		}
+		return Load(env(e))
+	}
+
+	cfg, err := load(nil)
+	if err != nil || cfg.RetentionPeriod != 90*24*time.Hour || cfg.CleanupInterval != time.Hour {
+		t.Fatalf("defaults: %+v, %v; want 90 days and 1h", cfg, err)
+	}
+	if cfg, err := load(map[string]string{"RETENTION_PERIOD": "0"}); err != nil || cfg.RetentionPeriod != 0 {
+		t.Errorf("RETENTION_PERIOD=0 (keep forever): %+v, %v", cfg.RetentionPeriod, err)
+	}
+	if cfg, err := load(map[string]string{"RETENTION_PERIOD": "24h", "CLEANUP_INTERVAL": "1m"}); err != nil || cfg.RetentionPeriod != 24*time.Hour || cfg.CleanupInterval != time.Minute {
+		t.Errorf("the smallest allowed values: %+v, %v", cfg, err)
+	}
+
+	for name, tt := range map[string]struct {
+		env  map[string]string
+		want string
+	}{
+		"a typo that would delete everything": {map[string]string{"RETENTION_PERIOD": "1s"}, "RETENTION_PERIOD (1s) must be 0 (keep forever) or at least 24h0m0s"},
+		"just under a day":                    {map[string]string{"RETENTION_PERIOD": "23h59m"}, "RETENTION_PERIOD"},
+		"negative":                            {map[string]string{"RETENTION_PERIOD": "-24h"}, "RETENTION_PERIOD must be between"},
+		"unparsable":                          {map[string]string{"RETENTION_PERIOD": "forever"}, "RETENTION_PERIOD"},
+		"cleanup too frequent":                {map[string]string{"CLEANUP_INTERVAL": "10s"}, "CLEANUP_INTERVAL must be between"},
+	} {
+		if _, err := load(tt.env); err == nil || !strings.Contains(err.Error(), tt.want) {
+			t.Errorf("%s: err = %v, want it to contain %q", name, err, tt.want)
+		}
+	}
+}
+
 func TestAllowPrivateDestinations(t *testing.T) {
 	base := map[string]string{"DATABASE_URL": "postgres://u:p@db/x"}
 	if cfg, _ := Load(env(base)); cfg.AllowPrivateDestinations {
