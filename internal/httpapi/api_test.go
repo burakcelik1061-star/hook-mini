@@ -247,7 +247,7 @@ func TestEndpointLifecycleOverHTTP(t *testing.T) {
 	srv, svc := newServer(t)
 	c := newTenantClient(t, srv, svc)
 
-	res := c.send("POST", "/v1/endpoints", map[string]any{"url": "https://example.com/hook", "description": "billing"})
+	res := c.send("POST", "/v1/endpoints", map[string]any{"url": "https://example.invalid/hook", "description": "billing"})
 	if res.StatusCode != http.StatusCreated {
 		t.Fatalf("create: %d %s", res.StatusCode, res.Body)
 	}
@@ -266,7 +266,7 @@ func TestEndpointLifecycleOverHTTP(t *testing.T) {
 	if !strings.HasPrefix(secret, "whsec_") {
 		t.Fatalf("creation response has no signing secret: %s", res.Body)
 	}
-	if created["status"] != "active" || created["description"] != "billing" || created["url"] != "https://example.com/hook" {
+	if created["status"] != "active" || created["description"] != "billing" || created["url"] != "https://example.invalid/hook" {
 		t.Errorf("unexpected body: %s", res.Body)
 	}
 
@@ -286,7 +286,7 @@ func TestEndpointLifecycleOverHTTP(t *testing.T) {
 	}
 
 	got := c.send("GET", "/v1/endpoints/"+id, nil).JSON()
-	if got["description"] != "updated" || got["url"] != "https://example.com/hook" {
+	if got["description"] != "updated" || got["url"] != "https://example.invalid/hook" {
 		t.Errorf("patch did not apply or changed other fields: %v", got)
 	}
 
@@ -306,7 +306,7 @@ func TestTenantsAreIsolatedOverHTTP(t *testing.T) {
 	srv, svc := newServer(t)
 	a, b := newTenantClient(t, srv, svc), newTenantClient(t, srv, svc)
 
-	ep := a.createEndpoint("https://example.com/a")
+	ep := a.createEndpoint("https://example.invalid/a")
 	epID := ep["id"].(string)
 	evRes := a.send("POST", "/v1/events", map[string]any{"type": "a.created", "payload": map[string]any{"x": 1}})
 	if evRes.StatusCode != http.StatusCreated {
@@ -334,7 +334,7 @@ func TestTenantsAreIsolatedOverHTTP(t *testing.T) {
 
 	// A's data is untouched by B's attempts.
 	got := a.send("GET", "/v1/endpoints/"+epID, nil).JSON()
-	if got["url"] != "https://example.com/a" {
+	if got["url"] != "https://example.invalid/a" {
 		t.Errorf("endpoint was modified by another tenant: %v", got)
 	}
 }
@@ -344,7 +344,7 @@ func TestRequestValidationOverHTTP(t *testing.T) {
 	c := newTenantClient(t, srv, svc)
 
 	big := func(n int) string {
-		return `{"url":"https://example.com","description":"` + strings.Repeat("x", n) + `"}`
+		return `{"url":"https://example.invalid","description":"` + strings.Repeat("x", n) + `"}`
 	}
 	bigEvent := `{"type":"a.b","payload":{"d":"` + strings.Repeat("x", 300<<10) + `"}}`
 
@@ -358,15 +358,15 @@ func TestRequestValidationOverHTTP(t *testing.T) {
 		code    string
 		field   string
 	}{
-		{"wrong content type", "POST", "/v1/endpoints", `{"url":"https://e.com"}`, []string{"Content-Type: text/plain"}, 415, "unsupported_media_type", ""},
-		{"no content type", "POST", "/v1/endpoints", `{"url":"https://e.com"}`, []string{"Content-Type: <delete>"}, 415, "unsupported_media_type", ""},
+		{"wrong content type", "POST", "/v1/endpoints", `{"url":"https://e.invalid"}`, []string{"Content-Type: text/plain"}, 415, "unsupported_media_type", ""},
+		{"no content type", "POST", "/v1/endpoints", `{"url":"https://e.invalid"}`, []string{"Content-Type: <delete>"}, 415, "unsupported_media_type", ""},
 		{"empty body", "POST", "/v1/endpoints", "", nil, 400, "invalid_request", "body"},
 		{"not json", "POST", "/v1/endpoints", "{nope", nil, 400, "invalid_request", "body"},
 		{"truncated json", "POST", "/v1/endpoints", `{"url":`, nil, 400, "invalid_request", "body"},
-		{"unknown field", "POST", "/v1/endpoints", `{"url":"https://e.com","descripton":"typo"}`, nil, 400, "invalid_request", "descripton"},
+		{"unknown field", "POST", "/v1/endpoints", `{"url":"https://e.invalid","descripton":"typo"}`, nil, 400, "invalid_request", "descripton"},
 		{"wrong type", "POST", "/v1/endpoints", `{"url":123}`, nil, 400, "invalid_request", "url"},
-		{"two json values", "POST", "/v1/endpoints", `{"url":"https://e.com"}{"url":"https://f.com"}`, nil, 400, "invalid_request", "body"},
-		{"trailing garbage", "POST", "/v1/endpoints", `{"url":"https://e.com"} x`, nil, 400, "invalid_request", "body"},
+		{"two json values", "POST", "/v1/endpoints", `{"url":"https://e.invalid"}{"url":"https://f.invalid"}`, nil, 400, "invalid_request", "body"},
+		{"trailing garbage", "POST", "/v1/endpoints", `{"url":"https://e.invalid"} x`, nil, 400, "invalid_request", "body"},
 		{"missing url", "POST", "/v1/endpoints", `{}`, nil, 400, "invalid_request", "url"},
 		{"bad url scheme", "POST", "/v1/endpoints", `{"url":"ftp://e.com"}`, nil, 400, "invalid_request", "url"},
 		{"url with credentials", "POST", "/v1/endpoints", `{"url":"https://u:p@e.com"}`, nil, 400, "invalid_request", "url"},
@@ -419,8 +419,8 @@ func TestRequestValidationOverHTTP(t *testing.T) {
 func TestEventIngestionStatuses(t *testing.T) {
 	srv, svc := newServer(t)
 	c := newTenantClient(t, srv, svc)
-	c.createEndpoint("https://example.com/1")
-	c.createEndpoint("https://example.com/2")
+	c.createEndpoint("https://example.invalid/1")
+	c.createEndpoint("https://example.invalid/2")
 
 	body := `{"type":"invoice.paid","payload":{"amount":42,"currency":"EUR"}}`
 	first := c.send("POST", "/v1/events", body, "Idempotency-Key: order-1001")
@@ -500,7 +500,7 @@ func TestListResponses(t *testing.T) {
 	}
 
 	for i := range 5 {
-		c.createEndpoint(fmt.Sprintf("https://example.com/%d", i))
+		c.createEndpoint(fmt.Sprintf("https://example.invalid/%d", i))
 	}
 	seen := map[string]bool{}
 	path := "/v1/endpoints?limit=2"

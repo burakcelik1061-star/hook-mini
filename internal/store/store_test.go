@@ -114,7 +114,7 @@ func newTenant(t *testing.T, ctx context.Context, q *store.Queries) store.Tenant
 func newEndpoint(t *testing.T, ctx context.Context, q *store.Queries, tenant uuid.UUID) store.Endpoint {
 	t.Helper()
 	ep, err := q.CreateEndpoint(ctx, store.CreateEndpointParams{
-		TenantID: tenant, Url: "https://example.com/hooks/" + uuid.NewString()[:8], Secret: secret,
+		TenantID: tenant, Url: "https://example.invalid/hooks/" + uuid.NewString()[:8], Secret: secret,
 	})
 	if err != nil {
 		t.Fatalf("CreateEndpoint: %v", err)
@@ -270,14 +270,14 @@ func TestConstraintsRejectBadData(t *testing.T) {
 	tn, ep, _, d := newDelivery(t, ctx, q)
 
 	t.Run("endpoint url", func(t *testing.T) {
-		for _, url := range []string{"ftp://example.com", "example.com/hook", "http://a b", "https://", ""} {
+		for _, url := range []string{"ftp://example.invalid", "example.invalid/hook", "http://a b", "https://", ""} {
 			requireViolation(t, tx, "endpoints_url_check", exec(ctx,
 				`INSERT INTO endpoints (tenant_id, url, secret) VALUES ($1, $2, $3)`, tn.ID, url, secret))
 		}
 	})
 	t.Run("endpoint secret too short", func(t *testing.T) {
 		requireViolation(t, tx, "endpoints_secret_check", exec(ctx,
-			`INSERT INTO endpoints (tenant_id, url, secret) VALUES ($1, 'https://example.com', 'short')`, tn.ID))
+			`INSERT INTO endpoints (tenant_id, url, secret) VALUES ($1, 'https://example.invalid', 'short')`, tn.ID))
 	})
 	t.Run("endpoint status", func(t *testing.T) {
 		requireViolation(t, tx, "endpoints_status_check", exec(ctx,
@@ -312,6 +312,18 @@ func TestConstraintsRejectBadData(t *testing.T) {
 	t.Run("a lease on a non in_flight delivery is rejected", func(t *testing.T) {
 		requireViolation(t, tx, "deliveries_lease_consistent", exec(ctx,
 			`UPDATE deliveries SET locked_until = now() WHERE id = $1`, d.ID))
+		requireViolation(t, tx, "deliveries_lease_consistent", exec(ctx,
+			`UPDATE deliveries SET lease_token = gen_random_uuid() WHERE id = $1`, d.ID))
+	})
+	t.Run("in_flight needs every part of the lease", func(t *testing.T) {
+		for _, set := range []string{
+			`locked_until = now(), locked_by = 'w1'`,                // no token
+			`locked_until = now(), lease_token = gen_random_uuid()`, // no owner
+			`locked_by = 'w1', lease_token = gen_random_uuid()`,     // no expiry
+		} {
+			requireViolation(t, tx, "deliveries_lease_consistent", exec(ctx,
+				`UPDATE deliveries SET status = 'in_flight', `+set+` WHERE id = $1`, d.ID))
+		}
 	})
 	t.Run("finished delivery needs completed_at", func(t *testing.T) {
 		requireViolation(t, tx, "deliveries_completed_consistent", exec(ctx,
@@ -334,8 +346,8 @@ func TestConstraintsRejectBadData(t *testing.T) {
 		}
 		defer func() { _ = sp.Rollback(ctx) }()
 		for _, stmt := range []string{
-			`UPDATE deliveries SET status = 'in_flight', locked_until = now() + interval '30 seconds', locked_by = 'w1' WHERE id = $1`,
-			`UPDATE deliveries SET status = 'pending', locked_until = NULL, locked_by = NULL, attempt_count = 1 WHERE id = $1`,
+			`UPDATE deliveries SET status = 'in_flight', locked_until = now() + interval '30 seconds', locked_by = 'w1', lease_token = gen_random_uuid() WHERE id = $1`,
+			`UPDATE deliveries SET status = 'pending', locked_until = NULL, locked_by = NULL, lease_token = NULL, attempt_count = 1 WHERE id = $1`,
 			`UPDATE deliveries SET status = 'succeeded', completed_at = now(), last_status_code = 200 WHERE id = $1`,
 		} {
 			if _, err := sp.Exec(ctx, stmt, d.ID); err != nil {

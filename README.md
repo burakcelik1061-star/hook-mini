@@ -4,10 +4,11 @@ A small webhook delivery service: applications send events, Hook Mini delivers
 them to subscriber endpoints with signed requests, retries and a delivery
 history. Think Svix, scaled down to something you can read in an afternoon.
 
-> **Status: Phase 2 (API).** You can register endpoints and submit events, and
-> every event is durably queued as one delivery per active endpoint. **Nothing
-> is sent to the endpoints yet**: the delivery engine (workers, retries,
-> signing) arrives in Phases 3 and 4. See [Roadmap](#roadmap).
+> **Status: Phase 3 (delivery).** Events are delivered to their endpoints by
+> workers, with retries, exponential backoff and dead-lettering. **Requests
+> are not signed yet and private-network targets are not blocked yet**; both
+> arrive in Phase 4, so do not point this at untrusted URLs. See
+> [Roadmap](#roadmap).
 
 ## Architecture
 
@@ -16,20 +17,21 @@ flowchart LR
     client[Client app] -->|HTTP| api
     subgraph Hook Mini
         api[api :8080]
-        worker[worker]
+        worker[worker x N]
         pg[(PostgreSQL)]
         api --> pg
         worker --> pg
     end
-    worker -.->|signed webhook, Phase 3-4| sub[Subscriber endpoint]
+    worker -->|POST webhook| sub[Subscriber endpoint]
 ```
 
 Two independent processes, one infrastructure dependency:
 
-- **api** serves HTTP. **worker** has no port and only talks to Postgres.
-- **PostgreSQL is the only service.** The job queue will use
-  `FOR UPDATE SKIP LOCKED` instead of Redis, so there is nothing else to run,
-  back up or keep consistent with the database.
+- **api** serves HTTP. **worker** has no port and only talks to Postgres; run
+  as many as you like, they coordinate through row locks and leases.
+- **PostgreSQL is the only service.** The job queue is a table read with
+  `FOR UPDATE SKIP LOCKED`, not Redis, so there is nothing else to run, back up
+  or keep consistent with the database.
 - **migrate** is a third binary that applies the embedded SQL migrations and
   exits; compose starts the api and worker only after it succeeds.
 
@@ -64,6 +66,57 @@ erDiagram
   without adding security.
 - **Typed queries come from sqlc**, generated from the same SQL migrations
   that create the schema, so the two cannot drift; CI fails if they do.
+
+## Delivery
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: event ingested
+    pending --> in_flight: claimed (lease)
+    in_flight --> succeeded: 2xx
+    in_flight --> pending: failure, attempts left (backoff)
+    in_flight --> dead: failure on the last attempt
+    in_flight --> pending: lease expired, attempts left (reaper)
+    in_flight --> dead: lease expired on the last attempt
+    in_flight --> dead: endpoint disabled (no request)
+```
+
+Each attempt is a `POST` with this body and headers:
+
+```json
+{"id": "<event id>", "type": "invoice.paid", "created_at": "2026-10-21T09:00:00Z", "data": {"amount": 42}}
+```
+
+`Content-Type: application/json`, `User-Agent: HookMini/1.0`, and
+`Webhook-Id: <event id>`, which is identical on every retry so receivers can
+drop duplicates. A `2xx` is a success; anything else, a timeout or a connection
+error is a failure. Redirects are not followed.
+
+**Guarantees.** Delivery is *at least once*.
+
+| Property | How |
+| --- | --- |
+| A delivery is never handed to two workers at once | One statement: rows selected `FOR UPDATE SKIP LOCKED` in a `MATERIALIZED` CTE (so the locking runs exactly once, which a plan test asserts), then updated with a `status = 'pending'` re-check. |
+| A crashed worker loses nothing | Every claim is a lease; any worker's reaper returns expired leases to the queue. |
+| A poison message cannot loop forever | The lost attempt counts, so it still ends after `DELIVERY_MAX_ATTEMPTS`. |
+| A late result never overwrites a newer one | A fresh `lease_token` per claim fences every write; writes only touch `in_flight` rows; attempt numbers are unique, and the reaper takes the stale worker's number. |
+| History is consistent | `attempt_count` always equals the number of attempt rows (asserted after every integration test). |
+| Stopping loses no work | No new claims after `SIGTERM`; attempts in flight finish and are recorded, or are cancelled after `SHUTDOWN_TIMEOUT` and retried. |
+
+**Retries.** Waits grow ×4 from `DELIVERY_BACKOFF_INITIAL` up to
+`DELIVERY_BACKOFF_MAX` (30s, 2m, 8m, 32m, 2h8m, then 6h; 8 attempts ≈ 15 hours),
+with jitter drawn from [base/2, base]. `Retry-After` on a 429/503 can lengthen
+a wait, never shorten it. All times come from the database clock.
+
+| Variable | Default | |
+| --- | --- | --- |
+| `WORKER_CONCURRENCY` | `10` | attempts in flight per worker |
+| `WORKER_BATCH_SIZE` | `10` | deliveries claimed per query |
+| `WORKER_POLL_INTERVAL` | `500ms` | wait when the queue is empty (worst-case pickup latency) |
+| `WORKER_LEASE_DURATION` | `60s` | must be ≥ `DELIVERY_TIMEOUT` + 5s |
+| `DELIVERY_TIMEOUT` | `15s` | one attempt, reading the response included |
+| `DELIVERY_MAX_ATTEMPTS` | `8` | |
+| `DELIVERY_BACKOFF_INITIAL` / `_MAX` | `30s` / `6h` | |
 
 ## Quick start
 
@@ -104,6 +157,23 @@ curl -s -X POST localhost:8080/v1/events \
 ```bash
 curl localhost:8080/healthz
 curl localhost:8080/readyz
+```
+
+### Watching deliveries locally
+
+A development receiver logs every webhook it gets. Start it, with short
+retries so failures are quick to watch:
+
+```bash
+DELIVERY_BACKOFF_INITIAL=1s DELIVERY_MAX_ATTEMPTS=3 docker compose --profile demo up -d --build
+```
+
+Register `http://receiver:9000/billing` (answers 200) and
+`http://receiver:9000/status/503` (always fails) as endpoints, submit an event,
+then:
+
+```bash
+docker compose logs -f receiver worker
 ```
 
 ## API
@@ -183,11 +253,17 @@ go test ./...
 
 Without `TEST_DATABASE_URL` the database tests skip themselves, so `go test
 ./...` stays green on a bare machine. Store tests run inside rolled-back
-transactions; the migration round-trip test (up, down to zero, up) uses a
-scratch database it creates and drops.
+transactions; the migration round-trip test (up, down to zero, up) and the
+worker tests use scratch databases they create and drop (a worker claims every
+due delivery in its database, so it must not share one with other tests).
 
-CI also runs `go test -race`, which needs cgo and is therefore not part of the
-local command on Windows.
+Do not run the compose `worker` against the database the tests use: it would
+pick up the deliveries tests create (their URLs use the reserved
+`.invalid` domain, so nothing would actually be reached).
+
+`go test -race ./...` needs cgo, i.e. a C compiler (on Windows, for example
+`winget install BrechtSanders.WinLibs.POSIX.UCRT` and `CGO_ENABLED=1`). CI
+runs it on every push.
 
 ## Changing the schema
 
@@ -205,8 +281,8 @@ go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate
 | --- | --- |
 | 0 | Foundation |
 | 1 | Data model and generated queries |
-| 2 | API keys, endpoints, event ingestion with idempotency (this) |
-| 3 | Queue, worker, retries with backoff and jitter, dead letters |
+| 2 | API keys, endpoints, event ingestion with idempotency |
+| 3 | Queue, worker, retries with backoff and jitter, dead letters (this) |
 | 4 | Request signing and SSRF protection |
 | 5 | Delivery history, manual replay, auto-disable of failing endpoints |
 | 6 | Integration and race tests |

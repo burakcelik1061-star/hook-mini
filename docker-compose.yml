@@ -42,10 +42,26 @@ services:
   worker:
     image: hook-mini:dev
     command: ["worker"]
-    environment: *app-env
+    environment:
+      <<: *app-env
+      # Overridable from the shell for demos, e.g.
+      # DELIVERY_BACKOFF_INITIAL=1s DELIVERY_MAX_ATTEMPTS=3 docker compose up -d
+      DELIVERY_BACKOFF_INITIAL: ${DELIVERY_BACKOFF_INITIAL:-30s}
+      DELIVERY_BACKOFF_MAX: ${DELIVERY_BACKOFF_MAX:-6h}
+      DELIVERY_MAX_ATTEMPTS: ${DELIVERY_MAX_ATTEMPTS:-8}
     depends_on:
       migrate:
         condition: service_completed_successfully
+
+  # Development-only webhook endpoint that logs what it receives. Start it
+  # with `docker compose --profile demo up -d` and register
+  # http://receiver:9000/anything (or /status/503 to watch retries).
+  receiver:
+    image: hook-mini:dev
+    command: ["receiver"]
+    profiles: ["demo"]
+    ports:
+      - "127.0.0.1:9000:9000"
 
 volumes:
   pgdata:

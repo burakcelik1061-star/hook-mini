@@ -1,5 +1,6 @@
 // Command worker delivers queued webhooks. It exposes no HTTP port: it shares
-// state with the api only through Postgres.
+// state with the api only through Postgres, and any number of workers can run
+// side by side.
 package main
 
 import (
@@ -8,6 +9,7 @@ import (
 
 	"github.com/burakcelik1061-star/hook-mini/internal/config"
 	"github.com/burakcelik1061-star/hook-mini/internal/database"
+	"github.com/burakcelik1061-star/hook-mini/internal/delivery"
 	"github.com/burakcelik1061-star/hook-mini/internal/lifecycle"
 	"github.com/burakcelik1061-star/hook-mini/internal/logging"
 )
@@ -35,10 +37,31 @@ func run() error {
 	}
 	defer pool.Close()
 
-	// The delivery loop arrives in Phase 3. Until then the worker only proves
-	// that it can start, reach the database and stop cleanly on a signal.
-	log.Info("worker started; delivery loop not implemented yet")
-	<-ctx.Done()
-	log.Info("worker stopping")
+	wc := cfg.Worker
+	w, err := delivery.NewWorker(pool, log, delivery.Config{
+		ID:             wc.ID,
+		Concurrency:    wc.Concurrency,
+		BatchSize:      wc.BatchSize,
+		PollInterval:   wc.PollInterval,
+		LeaseDuration:  wc.LeaseDuration,
+		RequestTimeout: wc.RequestTimeout,
+		DrainTimeout:   cfg.ShutdownTimeout,
+		Retry: delivery.RetryPolicy{
+			MaxAttempts:    wc.MaxAttempts,
+			InitialBackoff: wc.BackoffInitial,
+			MaxBackoff:     wc.BackoffMax,
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	log.Info("worker started",
+		"worker_id", w.ID(), "concurrency", wc.Concurrency, "lease", wc.LeaseDuration,
+		"request_timeout", wc.RequestTimeout, "max_attempts", wc.MaxAttempts)
+	if err := w.Run(ctx); err != nil {
+		return err
+	}
+	log.Info("worker stopped")
 	return nil
 }

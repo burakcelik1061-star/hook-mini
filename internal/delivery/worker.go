@@ -1,0 +1,467 @@
+package delivery
+
+import (
+	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/burakcelik1061-star/hook-mini/internal/store"
+)
+
+const (
+	// recordTimeout bounds writing an attempt's outcome. It is independent of
+	// shutdown, so a result that arrives while the worker is stopping is
+	// still saved.
+	recordTimeout = 10 * time.Second
+	// maxErrorBackoff caps the pause after repeated database errors.
+	maxErrorBackoff = 10 * time.Second
+	// reapBatch is how many expired leases one reaper pass reclaims at most.
+	reapBatch = 100
+
+	lostLeaseReason        = "lease expired: the worker stopped before reporting a result"
+	disabledEndpointReason = "endpoint is disabled; delivery abandoned without an attempt"
+)
+
+// errLeaseLost means the delivery is no longer leased to this attempt: the
+// lease expired and was reclaimed, or the delivery was deleted.
+var errLeaseLost = errors.New("lease lost")
+
+// Config tunes a Worker. DefaultConfig gives production values.
+type Config struct {
+	// ID identifies the worker in leases and logs. Empty means
+	// "<hostname>-<pid>-<random>".
+	ID string
+	// Concurrency is the maximum number of attempts in flight at once.
+	Concurrency int
+	// BatchSize is the maximum number of deliveries claimed per query.
+	BatchSize int
+	// PollInterval is how long to wait for new work once the queue has no
+	// more due deliveries.
+	PollInterval time.Duration
+	// LeaseDuration is how long a claimed delivery stays reserved. It must
+	// exceed RequestTimeout, or healthy attempts would be reclaimed.
+	LeaseDuration time.Duration
+	// ReapInterval is how often expired leases are reclaimed. Zero means
+	// half the lease duration.
+	ReapInterval time.Duration
+	// RequestTimeout bounds one HTTP attempt, reading the response included.
+	RequestTimeout time.Duration
+	// DrainTimeout is how long Run waits for attempts in flight after its
+	// context is cancelled before cancelling them too.
+	DrainTimeout time.Duration
+	// Retry decides when to retry and when to give up.
+	Retry RetryPolicy
+	// Transport sends the HTTP requests. Nil means a direct transport.
+	Transport http.RoundTripper
+}
+
+// DefaultConfig returns production defaults.
+func DefaultConfig() Config {
+	return Config{
+		Concurrency:    10,
+		BatchSize:      10,
+		PollInterval:   500 * time.Millisecond,
+		LeaseDuration:  60 * time.Second,
+		RequestTimeout: 15 * time.Second,
+		DrainTimeout:   15 * time.Second,
+		Retry:          DefaultRetryPolicy(),
+	}
+}
+
+func (c Config) validate() error {
+	switch {
+	case c.Concurrency < 1:
+		return errors.New("concurrency must be at least 1")
+	case c.BatchSize < 1:
+		return errors.New("batch size must be at least 1")
+	case c.PollInterval <= 0:
+		return errors.New("poll interval must be positive")
+	case c.RequestTimeout <= 0:
+		return errors.New("request timeout must be positive")
+	case c.LeaseDuration <= c.RequestTimeout:
+		return errors.New("lease duration must be longer than the request timeout")
+	case c.ReapInterval < 0:
+		return errors.New("reap interval must not be negative")
+	case c.DrainTimeout <= 0:
+		return errors.New("drain timeout must be positive")
+	}
+	if err := c.Retry.Validate(); err != nil {
+		return fmt.Errorf("retry policy: %w", err)
+	}
+	return nil
+}
+
+// Worker delivers queued webhooks. Any number of workers may run against the
+// same database; they coordinate only through row locks and leases.
+type Worker struct {
+	pool *pgxpool.Pool
+	q    *store.Queries
+	log  *slog.Logger
+	cfg  Config
+	http *sender
+}
+
+// NewWorker validates cfg and returns a Worker.
+func NewWorker(pool *pgxpool.Pool, log *slog.Logger, cfg Config) (*Worker, error) {
+	if err := cfg.validate(); err != nil {
+		return nil, fmt.Errorf("invalid worker config: %w", err)
+	}
+	if cfg.ID == "" {
+		cfg.ID = defaultID()
+	}
+	if cfg.ReapInterval == 0 {
+		cfg.ReapInterval = cfg.LeaseDuration / 2
+	}
+	// Claiming more than can run at once would only hold leases idle.
+	cfg.BatchSize = min(cfg.BatchSize, cfg.Concurrency)
+
+	return &Worker{
+		pool: pool,
+		q:    store.New(pool),
+		log:  log.With("worker_id", cfg.ID),
+		cfg:  cfg,
+		http: newSender(cfg.Transport, cfg.RequestTimeout),
+	}, nil
+}
+
+// ID returns the identity this worker writes into its leases.
+func (w *Worker) ID() string { return w.cfg.ID }
+
+// Run delivers webhooks until ctx is cancelled, then stops claiming new work,
+// lets attempts in flight finish (for at most DrainTimeout) and returns.
+func (w *Worker) Run(ctx context.Context) error {
+	// Attempts run under their own context so that stopping the worker does
+	// not abort requests mid-flight; it is cancelled only if draining takes
+	// longer than DrainTimeout.
+	attemptCtx, abortAttempts := context.WithCancel(context.Background())
+	defer abortAttempts()
+
+	reaperDone := make(chan struct{})
+	go func() {
+		defer close(reaperDone)
+		w.reapLoop(ctx)
+	}()
+
+	var inFlight sync.WaitGroup
+	slots := make(chan struct{}, w.cfg.Concurrency)
+	errDelay := w.cfg.PollInterval
+
+	for ctx.Err() == nil {
+		// Block until at least one slot is free, then take as many more as
+		// are free right now, up to the batch size.
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			continue
+		}
+		n := 1
+	fill:
+		for n < w.cfg.BatchSize {
+			select {
+			case slots <- struct{}{}:
+				n++
+			default:
+				break fill
+			}
+		}
+
+		jobs, err := w.claim(ctx, n)
+		for i := len(jobs); i < n; i++ {
+			<-slots // give back the slots that got no work
+		}
+		if len(jobs) > n {
+			// The claim query must never return more than n rows (see
+			// ClaimDueDeliveries). If it ever did, wait for slots for the
+			// extras rather than exceed the concurrency limit.
+			w.log.Error("claim returned more deliveries than requested", "requested", n, "got", len(jobs))
+			for i := n; i < len(jobs); i++ {
+				slots <- struct{}{}
+			}
+		}
+		if err != nil {
+			w.log.Error("claiming deliveries failed", "error", err, "retry_in", errDelay)
+			sleep(ctx, errDelay)
+			errDelay = min(errDelay*2, maxErrorBackoff)
+			continue
+		}
+		errDelay = w.cfg.PollInterval
+
+		for _, job := range jobs {
+			inFlight.Add(1)
+			go func() {
+				defer inFlight.Done()
+				defer func() { <-slots }()
+				w.process(attemptCtx, job)
+			}()
+		}
+		if len(jobs) < n {
+			// The queue has no more due work right now.
+			sleep(ctx, w.cfg.PollInterval)
+		}
+	}
+
+	<-reaperDone
+	return w.drain(&inFlight, abortAttempts)
+}
+
+func (w *Worker) drain(inFlight *sync.WaitGroup, abort context.CancelFunc) error {
+	done := make(chan struct{})
+	go func() {
+		inFlight.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-time.After(w.cfg.DrainTimeout):
+		w.log.Warn("attempts still running after the drain timeout; cancelling them", "drain_timeout", w.cfg.DrainTimeout)
+		abort()
+		<-done
+		return nil
+	}
+}
+
+// claim leases up to n due deliveries. It runs under its own context: once a
+// claim has been sent, its rows must be processed even if shutdown begins
+// meanwhile, or their leases would expire and cost each delivery an attempt.
+func (w *Worker) claim(ctx context.Context, n int) ([]store.ClaimDueDeliveriesRow, error) {
+	if ctx.Err() != nil {
+		return nil, nil
+	}
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), recordTimeout)
+	defer cancel()
+	return w.q.ClaimDueDeliveries(cctx, store.ClaimDueDeliveriesParams{
+		LeaseMs:   w.cfg.LeaseDuration.Milliseconds(),
+		WorkerID:  w.cfg.ID,
+		BatchSize: int32(n),
+	})
+}
+
+// process makes one attempt for a claimed delivery and records the outcome.
+func (w *Worker) process(ctx context.Context, job store.ClaimDueDeliveriesRow) {
+	log := w.log.With("delivery_id", job.ID, "endpoint_id", job.EndpointID, "event_id", job.EventID, "attempt", job.AttemptCount+1)
+
+	if job.EndpointStatus != "active" {
+		w.abandon(log, job, disabledEndpointReason)
+		return
+	}
+
+	msg, err := newMessage(job.EndpointUrl, job.EventID, job.EventType, job.EventCreatedAt, job.EventPayload)
+	if err != nil {
+		// Cannot happen for a payload Postgres accepted as jsonb; if it does,
+		// retrying will not help.
+		w.abandon(log, job, "could not build the request: "+err.Error())
+		return
+	}
+	w.record(log, job, w.http.send(ctx, msg))
+}
+
+// record writes the outcome of an attempt: the delivery's new state, the
+// attempt row and the endpoint's failure counter, all in one transaction and
+// all fenced by the lease token.
+func (w *Worker) record(log *slog.Logger, job store.ClaimDueDeliveriesRow, res result) {
+	ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
+	defer cancel()
+
+	attempt := job.AttemptCount + 1
+	code := statusCode(res.statusCode)
+	var (
+		outcome string
+		delay   time.Duration
+	)
+
+	err := pgx.BeginFunc(ctx, w.pool, func(tx pgx.Tx) error {
+		q := w.q.WithTx(tx)
+
+		// The endpoint row is locked before the delivery row. Deleting an
+		// endpoint locks them in that same order (the endpoint, then its
+		// deliveries through ON DELETE CASCADE); taking them the other way
+		// round here could deadlock with a concurrent delete. If the lease
+		// turns out to be lost, the whole transaction rolls back, counter
+		// included.
+		var err error
+		if res.ok() {
+			err = q.RecordEndpointSuccess(ctx, job.EndpointID)
+		} else {
+			_, err = q.RecordEndpointFailure(ctx, job.EndpointID)
+		}
+		if err != nil {
+			return err
+		}
+
+		var n int64
+		switch {
+		case res.ok():
+			outcome = "succeeded"
+			n, err = q.MarkDeliverySucceeded(ctx, store.MarkDeliverySucceededParams{
+				ID: job.ID, LeaseToken: job.LeaseToken, StatusCode: int32(res.statusCode),
+			})
+		case int(attempt) >= w.cfg.Retry.MaxAttempts:
+			outcome = "dead"
+			n, err = q.MarkDeliveryDead(ctx, store.MarkDeliveryDeadParams{
+				ID: job.ID, LeaseToken: job.LeaseToken, AttemptsUsed: 1, StatusCode: code, LastError: res.errText,
+			})
+		default:
+			outcome = "retry"
+			delay = w.cfg.Retry.nextDelay(int(attempt), res.retryAfter)
+			n, err = q.ScheduleDeliveryRetry(ctx, store.ScheduleDeliveryRetryParams{
+				ID: job.ID, LeaseToken: job.LeaseToken, DelayMs: delay.Milliseconds(), StatusCode: code, LastError: res.errText,
+			})
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return errLeaseLost
+		}
+
+		_, err = q.CreateDeliveryAttempt(ctx, store.CreateDeliveryAttemptParams{
+			DeliveryID:      job.ID,
+			AttemptNo:       attempt,
+			StartedAt:       res.started,
+			DurationMs:      int32(min(res.duration.Milliseconds(), math.MaxInt32)),
+			StatusCode:      code,
+			ResponseSnippet: nonEmpty(res.snippet),
+			Error:           nonEmpty(res.errText),
+		})
+		return err
+	})
+
+	attrs := []any{"status_code", res.statusCode, "duration_ms", res.duration.Milliseconds()}
+	switch {
+	case errors.Is(err, errLeaseLost):
+		log.Warn("result discarded: the lease was lost (expired and reclaimed, or the delivery was deleted)", attrs...)
+	case err != nil:
+		// The delivery stays in flight; its lease will expire and the reaper
+		// returns it to the queue, so the attempt is retried, not lost.
+		log.Error("recording the attempt failed", append(attrs, "error", err)...)
+	case outcome == "succeeded":
+		log.Info("delivered", attrs...)
+	case outcome == "retry":
+		log.Warn("attempt failed; will retry", append(attrs, "error", res.errText, "retry_in", delay.Round(time.Millisecond))...)
+	default:
+		log.Warn("attempt failed; giving up after the last attempt", append(attrs, "error", res.errText)...)
+	}
+}
+
+// abandon marks a delivery dead without making an attempt.
+func (w *Worker) abandon(log *slog.Logger, job store.ClaimDueDeliveriesRow, reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
+	defer cancel()
+	n, err := w.q.MarkDeliveryDead(ctx, store.MarkDeliveryDeadParams{
+		ID: job.ID, LeaseToken: job.LeaseToken, AttemptsUsed: 0, LastError: reason,
+	})
+	switch {
+	case err != nil:
+		log.Error("abandoning the delivery failed", "reason", reason, "error", err)
+	case n == 0:
+		log.Warn("delivery not abandoned: the lease was lost", "reason", reason)
+	default:
+		log.Warn("delivery abandoned", "reason", reason)
+	}
+}
+
+func (w *Worker) reapLoop(ctx context.Context) {
+	t := time.NewTicker(w.cfg.ReapInterval)
+	defer t.Stop()
+	for {
+		// Reap right away on start: leases left by a previous instance of
+		// this worker may already have expired.
+		for {
+			n, err := w.reapOnce(ctx)
+			if err != nil {
+				if ctx.Err() == nil {
+					w.log.Error("reclaiming expired leases failed", "error", err)
+				}
+				break
+			}
+			if n < reapBatch {
+				break
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// reapOnce returns up to reapBatch deliveries with expired leases to the
+// queue and records the lost attempts, in one transaction.
+func (w *Worker) reapOnce(ctx context.Context) (int, error) {
+	var rows []store.ReclaimExpiredLeasesRow
+	err := pgx.BeginFunc(ctx, w.pool, func(tx pgx.Tx) error {
+		q := w.q.WithTx(tx)
+		var err error
+		rows, err = q.ReclaimExpiredLeases(ctx, store.ReclaimExpiredLeasesParams{
+			MaxAttempts: int32(w.cfg.Retry.MaxAttempts), Reason: lostLeaseReason, BatchSize: reapBatch,
+		})
+		if err != nil || len(rows) == 0 {
+			return err
+		}
+		ids := make([]uuid.UUID, len(rows))
+		nos := make([]int32, len(rows))
+		for i, r := range rows {
+			ids[i], nos[i] = r.ID, r.AttemptCount
+		}
+		return q.RecordLostAttempts(ctx, store.RecordLostAttemptsParams{DeliveryIds: ids, AttemptNos: nos, Reason: lostLeaseReason})
+	})
+	if err != nil {
+		return 0, err
+	}
+	for _, r := range rows {
+		prev := ""
+		if r.PreviousWorker != nil {
+			prev = *r.PreviousWorker
+		}
+		w.log.Warn("reclaimed a delivery whose lease expired",
+			"delivery_id", r.ID, "previous_worker", prev, "attempts", r.AttemptCount, "status", r.Status)
+	}
+	return len(rows), nil
+}
+
+func sleep(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	}
+}
+
+func statusCode(c int) *int32 {
+	if c == 0 {
+		return nil
+	}
+	v := int32(c)
+	return &v
+}
+
+func nonEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+func defaultID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "worker"
+	}
+	b := make([]byte, 3)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("%s-%d-%x", host, os.Getpid(), b)
+}

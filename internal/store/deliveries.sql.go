@@ -36,7 +36,7 @@ SELECT e.tenant_id, $1, e.id
 FROM endpoints e
 WHERE e.tenant_id = $2 AND e.status = 'active'
 ON CONFLICT (event_id, endpoint_id) DO NOTHING
-RETURNING id, tenant_id, event_id, endpoint_id, status, attempt_count, next_attempt_at, locked_until, locked_by, last_status_code, last_error, completed_at, created_at, updated_at
+RETURNING id, tenant_id, event_id, endpoint_id, status, attempt_count, next_attempt_at, locked_until, locked_by, last_status_code, last_error, completed_at, created_at, updated_at, lease_token
 `
 
 type CreateDeliveriesForEventParams struct {
@@ -75,6 +75,7 @@ func (q *Queries) CreateDeliveriesForEvent(ctx context.Context, arg CreateDelive
 			&i.CompletedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.LeaseToken,
 		); err != nil {
 			return nil, err
 		}
@@ -129,7 +130,7 @@ func (q *Queries) CreateDeliveryAttempt(ctx context.Context, arg CreateDeliveryA
 }
 
 const getDelivery = `-- name: GetDelivery :one
-SELECT id, tenant_id, event_id, endpoint_id, status, attempt_count, next_attempt_at, locked_until, locked_by, last_status_code, last_error, completed_at, created_at, updated_at FROM deliveries
+SELECT id, tenant_id, event_id, endpoint_id, status, attempt_count, next_attempt_at, locked_until, locked_by, last_status_code, last_error, completed_at, created_at, updated_at, lease_token FROM deliveries
 WHERE id = $1 AND tenant_id = $2
 `
 
@@ -156,12 +157,13 @@ func (q *Queries) GetDelivery(ctx context.Context, arg GetDeliveryParams) (Deliv
 		&i.CompletedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.LeaseToken,
 	)
 	return i, err
 }
 
 const listDeliveries = `-- name: ListDeliveries :many
-SELECT id, tenant_id, event_id, endpoint_id, status, attempt_count, next_attempt_at, locked_until, locked_by, last_status_code, last_error, completed_at, created_at, updated_at FROM deliveries
+SELECT id, tenant_id, event_id, endpoint_id, status, attempt_count, next_attempt_at, locked_until, locked_by, last_status_code, last_error, completed_at, created_at, updated_at, lease_token FROM deliveries
 WHERE tenant_id = $1
   AND ($2::uuid IS NULL OR endpoint_id = $2::uuid)
   AND ($3::text IS NULL OR status = $3::text)
@@ -214,6 +216,7 @@ func (q *Queries) ListDeliveries(ctx context.Context, arg ListDeliveriesParams) 
 			&i.CompletedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.LeaseToken,
 		); err != nil {
 			return nil, err
 		}

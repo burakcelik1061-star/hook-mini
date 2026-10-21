@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -27,6 +28,22 @@ type Config struct {
 	// ShutdownTimeout bounds how long a process waits for in-flight work to
 	// finish after receiving a termination signal.
 	ShutdownTimeout time.Duration
+	// Worker holds the delivery worker's settings.
+	Worker Worker
+}
+
+// Worker configures the delivery worker.
+type Worker struct {
+	// ID names the worker in leases and logs; empty means generated.
+	ID             string
+	Concurrency    int
+	BatchSize      int
+	PollInterval   time.Duration
+	LeaseDuration  time.Duration
+	RequestTimeout time.Duration
+	MaxAttempts    int
+	BackoffInitial time.Duration
+	BackoffMax     time.Duration
 }
 
 // Load builds a Config from getenv (usually os.Getenv). All problems are
@@ -64,15 +81,51 @@ func Load(getenv func(string) string) (Config, error) {
 		fail("LOG_FORMAT must be \"json\" or \"text\", got %q", cfg.LogFormat)
 	}
 
-	d, err := time.ParseDuration(get("SHUTDOWN_TIMEOUT", "15s"))
-	switch {
-	case err != nil:
-		fail("SHUTDOWN_TIMEOUT: %v", err)
-	case d <= 0:
-		fail("SHUTDOWN_TIMEOUT must be positive, got %s", d)
-	default:
-		cfg.ShutdownTimeout = d
+	// duration parses key and checks it lies in [lo, hi].
+	duration := func(key, def string, lo, hi time.Duration) time.Duration {
+		d, err := time.ParseDuration(get(key, def))
+		switch {
+		case err != nil:
+			fail("%s: %v", key, err)
+		case d < lo || d > hi:
+			fail("%s must be between %s and %s, got %s", key, lo, hi, d)
+		}
+		return d
 	}
+	// integer parses key and checks it lies in [lo, hi].
+	integer := func(key string, def, lo, hi int) int {
+		n, err := strconv.Atoi(get(key, strconv.Itoa(def)))
+		switch {
+		case err != nil:
+			fail("%s must be an integer", key)
+		case n < lo || n > hi:
+			fail("%s must be between %d and %d, got %d", key, lo, hi, n)
+		}
+		return n
+	}
+
+	cfg.ShutdownTimeout = duration("SHUTDOWN_TIMEOUT", "15s", time.Second, 10*time.Minute)
+
+	w := Worker{
+		ID:             get("WORKER_ID", ""),
+		Concurrency:    integer("WORKER_CONCURRENCY", 10, 1, 1000),
+		BatchSize:      integer("WORKER_BATCH_SIZE", 10, 1, 1000),
+		PollInterval:   duration("WORKER_POLL_INTERVAL", "500ms", 10*time.Millisecond, time.Minute),
+		LeaseDuration:  duration("WORKER_LEASE_DURATION", "60s", time.Second, time.Hour),
+		RequestTimeout: duration("DELIVERY_TIMEOUT", "15s", time.Second, 5*time.Minute),
+		MaxAttempts:    integer("DELIVERY_MAX_ATTEMPTS", 8, 1, 50),
+		BackoffInitial: duration("DELIVERY_BACKOFF_INITIAL", "30s", 100*time.Millisecond, 24*time.Hour),
+		BackoffMax:     duration("DELIVERY_BACKOFF_MAX", "6h", 100*time.Millisecond, 7*24*time.Hour),
+	}
+	// A lease shorter than a request (plus time to record the result) would
+	// let healthy attempts be reclaimed and sent twice.
+	if w.LeaseDuration > 0 && w.RequestTimeout > 0 && w.LeaseDuration < w.RequestTimeout+5*time.Second {
+		fail("WORKER_LEASE_DURATION (%s) must be at least DELIVERY_TIMEOUT (%s) plus 5s", w.LeaseDuration, w.RequestTimeout)
+	}
+	if w.BackoffMax < w.BackoffInitial {
+		fail("DELIVERY_BACKOFF_MAX (%s) must not be smaller than DELIVERY_BACKOFF_INITIAL (%s)", w.BackoffMax, w.BackoffInitial)
+	}
+	cfg.Worker = w
 
 	if len(errs) > 0 {
 		return Config{}, fmt.Errorf("invalid configuration: %w", errors.Join(errs...))

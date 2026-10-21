@@ -37,6 +37,7 @@ type Delivery struct {
 	CompletedAt    *time.Time
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+	LeaseToken     *uuid.UUID
 }
 
 type DeliveryAttempt struct {

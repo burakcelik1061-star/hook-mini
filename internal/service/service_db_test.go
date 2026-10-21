@@ -72,7 +72,7 @@ func newTenant(t *testing.T, s *Service) store.Tenant {
 func newEndpoint(t *testing.T, s *Service, tenant uuid.UUID) store.Endpoint {
 	t.Helper()
 	ep, err := s.CreateEndpoint(context.Background(), tenant, EndpointInput{
-		URL: "https://example.com/hooks/" + uuid.NewString()[:8],
+		URL: "https://example.invalid/hooks/" + uuid.NewString()[:8],
 	})
 	if err != nil {
 		t.Fatalf("CreateEndpoint: %v", err)
@@ -153,7 +153,7 @@ func TestEndpointLifecycleAndIsolation(t *testing.T) {
 	s := newService(t)
 	a, b := newTenant(t, s), newTenant(t, s)
 
-	ep, err := s.CreateEndpoint(ctx(), a.ID, EndpointInput{URL: "https://example.com/hook", Description: "billing"})
+	ep, err := s.CreateEndpoint(ctx(), a.ID, EndpointInput{URL: "https://example.invalid/hook", Description: "billing"})
 	if err != nil {
 		t.Fatalf("CreateEndpoint: %v", err)
 	}
@@ -181,12 +181,12 @@ func TestEndpointLifecycleAndIsolation(t *testing.T) {
 	}
 
 	// Partial update changes only what is sent.
-	up, err := s.UpdateEndpoint(ctx(), a.ID, ep.ID, EndpointPatch{URL: ptr("https://example.org/new")})
-	if err != nil || up.Url != "https://example.org/new" || up.Description != "billing" {
+	up, err := s.UpdateEndpoint(ctx(), a.ID, ep.ID, EndpointPatch{URL: ptr("https://example.invalid/new")})
+	if err != nil || up.Url != "https://example.invalid/new" || up.Description != "billing" {
 		t.Fatalf("partial update: %+v err=%v", up, err)
 	}
 	up, err = s.UpdateEndpoint(ctx(), a.ID, ep.ID, EndpointPatch{Description: ptr("")})
-	if err != nil || up.Description != "" || up.Url != "https://example.org/new" {
+	if err != nil || up.Description != "" || up.Url != "https://example.invalid/new" {
 		t.Fatalf("clearing the description: %+v err=%v", up, err)
 	}
 	if up.Secret != ep.Secret {
@@ -212,12 +212,12 @@ func TestCreateEndpointValidation(t *testing.T) {
 
 	_, err := s.CreateEndpoint(ctx(), tn.ID, EndpointInput{URL: ""})
 	wantField(t, err, "url")
-	_, err = s.CreateEndpoint(ctx(), tn.ID, EndpointInput{URL: "https://example.com", Description: strings.Repeat("x", 501)})
+	_, err = s.CreateEndpoint(ctx(), tn.ID, EndpointInput{URL: "https://example.invalid", Description: strings.Repeat("x", 501)})
 	wantField(t, err, "description")
 
 	// Two endpoints with the same URL are allowed (different secrets).
-	a, err1 := s.CreateEndpoint(ctx(), tn.ID, EndpointInput{URL: "https://example.com/same"})
-	b, err2 := s.CreateEndpoint(ctx(), tn.ID, EndpointInput{URL: "https://example.com/same"})
+	a, err1 := s.CreateEndpoint(ctx(), tn.ID, EndpointInput{URL: "https://example.invalid/same"})
+	b, err2 := s.CreateEndpoint(ctx(), tn.ID, EndpointInput{URL: "https://example.invalid/same"})
 	if err1 != nil || err2 != nil || a.Secret == b.Secret {
 		t.Errorf("duplicate URLs: %v %v, equal secrets: %v", err1, err2, a.Secret == b.Secret)
 	}

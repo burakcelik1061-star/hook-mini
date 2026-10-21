@@ -11,6 +11,31 @@ import (
 )
 
 type Querier interface {
+	// Queries used only by the delivery worker.
+	//
+	// Time is always taken from the database (now()), never from the worker's
+	// clock: the claim query compares next_attempt_at with now(), so writing it
+	// from a skewed worker clock would make retries fire early or late.
+	//
+	// Parameters are written sqlc.arg(name), not the @name shorthand: in Postgres @
+	// is also the absolute-value operator, and in arithmetic such as
+	// `now() + @x::bigint * interval '1 ms'` sqlc misparses the shorthand.
+	//
+	// Invariant kept by these queries: attempt_count always equals the number of
+	// delivery_attempts rows for the delivery.
+	// Atomically takes up to batch_size due deliveries and leases them to one
+	// worker. SKIP LOCKED makes concurrent workers pass over rows another worker
+	// is claiming instead of waiting for them, so no row is ever handed out twice.
+	// attempt_count is not changed here; it advances when the attempt is recorded
+	// (or when an expired lease is reclaimed). The event and endpoint are joined
+	// in so the worker needs no second round trip.
+	//
+	// The locking SELECT must be a MATERIALIZED CTE, not a subquery in FROM: as a
+	// subquery the planner may put it on the inner side of a nested loop and run
+	// it once per outer row. Each run skips the rows it already locked and locks
+	// new ones, so the claim could return more than batch_size rows. A
+	// materialized CTE runs exactly once (see TestClaimLocksOnce).
+	ClaimDueDeliveries(ctx context.Context, arg ClaimDueDeliveriesParams) ([]ClaimDueDeliveriesRow, error)
 	CountDeliveriesForEvent(ctx context.Context, arg CountDeliveriesForEventParams) (int64, error)
 	CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (ApiKey, error)
 	// Phase 1 covers creating and reading deliveries. The worker's queries (claim
@@ -62,12 +87,30 @@ type Querier interface {
 	// constant cost per page, unlike OFFSET.
 	ListEndpoints(ctx context.Context, arg ListEndpointsParams) ([]Endpoint, error)
 	ListEvents(ctx context.Context, arg ListEventsParams) ([]Event, error)
+	// attempts_used is 1 when an HTTP attempt was made and 0 when the delivery is
+	// abandoned without one (for example because its endpoint is disabled).
+	MarkDeliveryDead(ctx context.Context, arg MarkDeliveryDeadParams) (int64, error)
+	// The three outcomes of an attempt. Each is fenced: it changes the row only
+	// if it is still in flight under the caller's lease_token, and reports how
+	// many rows it changed. 0 means the lease was lost (expired and reclaimed,
+	// or the delivery was deleted) and the caller must discard its result.
+	MarkDeliverySucceeded(ctx context.Context, arg MarkDeliverySucceededParams) (int64, error)
+	// Returns deliveries whose worker vanished (crashed, was killed, lost its
+	// network) to the queue. The lost attempt counts: the request may well have
+	// reached the endpoint, and counting it is what stops a delivery that crashes
+	// every worker from being retried forever. Run it in a transaction together
+	// with RecordLostAttempts, which writes the matching attempt rows. The locking
+	// SELECT is a MATERIALIZED CTE for the same reason as in ClaimDueDeliveries.
+	ReclaimExpiredLeases(ctx context.Context, arg ReclaimExpiredLeasesParams) ([]ReclaimExpiredLeasesRow, error)
 	// An atomic increment, not read-modify-write: two workers failing at the same
 	// moment must count as two failures, not one.
 	RecordEndpointFailure(ctx context.Context, id uuid.UUID) (int32, error)
 	RecordEndpointSuccess(ctx context.Context, id uuid.UUID) error
+	// One attempt row per reclaimed delivery, numbered with its new attempt_count.
+	RecordLostAttempts(ctx context.Context, arg RecordLostAttemptsParams) error
 	// Returns no row if the key does not exist for this tenant or is already revoked.
 	RevokeAPIKey(ctx context.Context, arg RevokeAPIKeyParams) (uuid.UUID, error)
+	ScheduleDeliveryRetry(ctx context.Context, arg ScheduleDeliveryRetryParams) (int64, error)
 	// Throttled to one write per minute per key, so authenticating a request does
 	// not turn into a write on a hot row.
 	TouchAPIKey(ctx context.Context, id uuid.UUID) error
