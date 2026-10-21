@@ -1,0 +1,51 @@
+name: hook-mini
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: hookmini
+      POSTGRES_PASSWORD: hookmini
+      POSTGRES_DB: hookmini
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hookmini -d hookmini"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Runs once and exits; api and worker start only after it succeeded.
+  migrate:
+    build: .
+    image: hook-mini:dev
+    command: ["migrate"]
+    environment: &app-env
+      DATABASE_URL: postgres://hookmini:hookmini@postgres:5432/hookmini?sslmode=disable
+      LOG_FORMAT: text
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    image: hook-mini:dev
+    command: ["api"]
+    environment: *app-env
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    image: hook-mini:dev
+    command: ["worker"]
+    environment: *app-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
