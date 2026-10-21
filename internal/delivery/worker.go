@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
 	"github.com/burakcelik1061-star/hook-mini/internal/store"
 )
 
@@ -62,7 +63,11 @@ type Config struct {
 	DrainTimeout time.Duration
 	// Retry decides when to retry and when to give up.
 	Retry RetryPolicy
-	// Transport sends the HTTP requests. Nil means a direct transport.
+	// AllowPrivateNetworks lets requests reach loopback, private and
+	// link-local addresses. Off by default; only for development and tests.
+	AllowPrivateNetworks bool
+	// Transport sends the HTTP requests. Nil means a transport that enforces
+	// the destination policy at dial time; set it only in tests.
 	Transport http.RoundTripper
 }
 
@@ -126,12 +131,17 @@ func NewWorker(pool *pgxpool.Pool, log *slog.Logger, cfg Config) (*Worker, error
 	// Claiming more than can run at once would only hold leases idle.
 	cfg.BatchSize = min(cfg.BatchSize, cfg.Concurrency)
 
+	transport := cfg.Transport
+	if transport == nil {
+		transport = safedial.Policy{AllowPrivate: cfg.AllowPrivateNetworks}.Transport()
+	}
+
 	return &Worker{
 		pool: pool,
 		q:    store.New(pool),
 		log:  log.With("worker_id", cfg.ID),
 		cfg:  cfg,
-		http: newSender(cfg.Transport, cfg.RequestTimeout),
+		http: newSender(transport, cfg.RequestTimeout),
 	}, nil
 }
 
@@ -257,10 +267,14 @@ func (w *Worker) process(ctx context.Context, job store.ClaimDueDeliveriesRow) {
 		return
 	}
 
-	msg, err := newMessage(job.EndpointUrl, job.EventID, job.EventType, job.EventCreatedAt, job.EventPayload)
+	secrets := []string{job.EndpointSecret}
+	if job.PreviousSecretValid && job.EndpointPreviousSecret != nil {
+		secrets = append(secrets, *job.EndpointPreviousSecret)
+	}
+	msg, err := newMessage(job.EndpointUrl, job.EventID, job.EventType, job.EventCreatedAt, job.EventPayload, secrets...)
 	if err != nil {
-		// Cannot happen for a payload Postgres accepted as jsonb; if it does,
-		// retrying will not help.
+		// Only a corrupt secret or payload gets here, and retrying will not
+		// fix either. The error never contains the secret itself.
 		w.abandon(log, job, "could not build the request: "+err.Error())
 		return
 	}

@@ -53,17 +53,19 @@ type DeliveryAttempt struct {
 }
 
 type Endpoint struct {
-	ID                  uuid.UUID
-	TenantID            uuid.UUID
-	Url                 string
-	Description         string
-	Secret              string `json:"-"`
-	Status              string
-	ConsecutiveFailures int32
-	DisabledAt          *time.Time
-	DisabledReason      *string
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	ID                      uuid.UUID
+	TenantID                uuid.UUID
+	Url                     string
+	Description             string
+	Secret                  string `json:"-"`
+	Status                  string
+	ConsecutiveFailures     int32
+	DisabledAt              *time.Time
+	DisabledReason          *string
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
+	PreviousSecret          *string `json:"-"`
+	PreviousSecretExpiresAt *time.Time
 }
 
 type Event struct {

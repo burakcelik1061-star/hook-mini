@@ -76,13 +76,15 @@ func KeyMatches(raw string, storedHash []byte) bool {
 	return subtle.ConstantTimeCompare(h[:], storedHash) == 1
 }
 
-// NewSigningSecret returns a random secret for signing webhook requests.
+// NewSigningSecret returns a random 256-bit secret for signing webhook
+// requests, as "whsec_" followed by standard base64: the Standard Webhooks
+// format, so receivers can use that standard's libraries to verify.
 func NewSigningSecret() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", fmt.Errorf("generate signing secret: %w", err)
 	}
-	return SigningSecretPrefix + base64.RawURLEncoding.EncodeToString(b), nil
+	return SigningSecretPrefix + base64.StdEncoding.EncodeToString(b), nil
 }
 
 func isLowerHex(s string) bool {

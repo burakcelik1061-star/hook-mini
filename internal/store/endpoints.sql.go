@@ -16,7 +16,7 @@ const createEndpoint = `-- name: CreateEndpoint :one
 
 INSERT INTO endpoints (tenant_id, url, description, secret)
 VALUES ($1, $2, $3, $4)
-RETURNING id, tenant_id, url, description, secret, status, consecutive_failures, disabled_at, disabled_reason, created_at, updated_at
+RETURNING id, tenant_id, url, description, secret, status, consecutive_failures, disabled_at, disabled_reason, created_at, updated_at, previous_secret, previous_secret_expires_at
 `
 
 type CreateEndpointParams struct {
@@ -48,6 +48,8 @@ func (q *Queries) CreateEndpoint(ctx context.Context, arg CreateEndpointParams) 
 		&i.DisabledReason,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PreviousSecret,
+		&i.PreviousSecretExpiresAt,
 	)
 	return i, err
 }
@@ -94,7 +96,7 @@ const enableEndpoint = `-- name: EnableEndpoint :one
 UPDATE endpoints
 SET status = 'active', disabled_at = NULL, disabled_reason = NULL, consecutive_failures = 0
 WHERE id = $1 AND tenant_id = $2
-RETURNING id, tenant_id, url, description, secret, status, consecutive_failures, disabled_at, disabled_reason, created_at, updated_at
+RETURNING id, tenant_id, url, description, secret, status, consecutive_failures, disabled_at, disabled_reason, created_at, updated_at, previous_secret, previous_secret_expires_at
 `
 
 type EnableEndpointParams struct {
@@ -117,12 +119,14 @@ func (q *Queries) EnableEndpoint(ctx context.Context, arg EnableEndpointParams) 
 		&i.DisabledReason,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PreviousSecret,
+		&i.PreviousSecretExpiresAt,
 	)
 	return i, err
 }
 
 const getEndpoint = `-- name: GetEndpoint :one
-SELECT id, tenant_id, url, description, secret, status, consecutive_failures, disabled_at, disabled_reason, created_at, updated_at FROM endpoints
+SELECT id, tenant_id, url, description, secret, status, consecutive_failures, disabled_at, disabled_reason, created_at, updated_at, previous_secret, previous_secret_expires_at FROM endpoints
 WHERE id = $1 AND tenant_id = $2
 `
 
@@ -146,6 +150,8 @@ func (q *Queries) GetEndpoint(ctx context.Context, arg GetEndpointParams) (Endpo
 		&i.DisabledReason,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PreviousSecret,
+		&i.PreviousSecretExpiresAt,
 	)
 	return i, err
 }
@@ -177,7 +183,7 @@ func (q *Queries) ListActiveEndpointIDs(ctx context.Context, tenantID uuid.UUID)
 }
 
 const listEndpoints = `-- name: ListEndpoints :many
-SELECT id, tenant_id, url, description, secret, status, consecutive_failures, disabled_at, disabled_reason, created_at, updated_at FROM endpoints
+SELECT id, tenant_id, url, description, secret, status, consecutive_failures, disabled_at, disabled_reason, created_at, updated_at, previous_secret, previous_secret_expires_at FROM endpoints
 WHERE tenant_id = $1
   AND (
     $2::timestamptz IS NULL
@@ -222,6 +228,8 @@ func (q *Queries) ListEndpoints(ctx context.Context, arg ListEndpointsParams) ([
 			&i.DisabledReason,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.PreviousSecret,
+			&i.PreviousSecretExpiresAt,
 		); err != nil {
 			return nil, err
 		}
@@ -260,12 +268,56 @@ func (q *Queries) RecordEndpointSuccess(ctx context.Context, id uuid.UUID) error
 	return err
 }
 
+const rotateEndpointSecret = `-- name: RotateEndpointSecret :one
+UPDATE endpoints
+SET previous_secret            = secret,
+    previous_secret_expires_at = now() + $1::bigint * interval '1 millisecond',
+    secret                     = $2::text
+WHERE id = $3 AND tenant_id = $4
+RETURNING id, tenant_id, url, description, secret, status, consecutive_failures, disabled_at, disabled_reason, created_at, updated_at, previous_secret, previous_secret_expires_at
+`
+
+type RotateEndpointSecretParams struct {
+	GraceMs   int64
+	NewSecret string
+	ID        uuid.UUID
+	TenantID  uuid.UUID
+}
+
+// The current secret becomes the previous one, valid for grace_ms more; a
+// second rotation inside that window drops the oldest secret.
+func (q *Queries) RotateEndpointSecret(ctx context.Context, arg RotateEndpointSecretParams) (Endpoint, error) {
+	row := q.db.QueryRow(ctx, rotateEndpointSecret,
+		arg.GraceMs,
+		arg.NewSecret,
+		arg.ID,
+		arg.TenantID,
+	)
+	var i Endpoint
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Url,
+		&i.Description,
+		&i.Secret,
+		&i.Status,
+		&i.ConsecutiveFailures,
+		&i.DisabledAt,
+		&i.DisabledReason,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.PreviousSecret,
+		&i.PreviousSecretExpiresAt,
+	)
+	return i, err
+}
+
 const updateEndpoint = `-- name: UpdateEndpoint :one
 UPDATE endpoints
 SET url         = COALESCE($1, url),
     description = COALESCE($2, description)
 WHERE id = $3 AND tenant_id = $4
-RETURNING id, tenant_id, url, description, secret, status, consecutive_failures, disabled_at, disabled_reason, created_at, updated_at
+RETURNING id, tenant_id, url, description, secret, status, consecutive_failures, disabled_at, disabled_reason, created_at, updated_at, previous_secret, previous_secret_expires_at
 `
 
 type UpdateEndpointParams struct {
@@ -296,6 +348,8 @@ func (q *Queries) UpdateEndpoint(ctx context.Context, arg UpdateEndpointParams) 
 		&i.DisabledReason,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.PreviousSecret,
+		&i.PreviousSecretExpiresAt,
 	)
 	return i, err
 }

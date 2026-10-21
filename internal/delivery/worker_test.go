@@ -14,6 +14,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -23,8 +24,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/burakcelik1061-star/hook-mini/internal/database"
+	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
 	"github.com/burakcelik1061-star/hook-mini/internal/service"
 	"github.com/burakcelik1061-star/hook-mini/internal/store"
+	"github.com/burakcelik1061-star/hook-mini/pkg/webhook"
 )
 
 // Worker tests run real workers against a real Postgres and real HTTP
@@ -110,6 +113,8 @@ func testConfig(id string) Config {
 		RequestTimeout: time.Second,
 		DrainTimeout:   3 * time.Second,
 		Retry:          RetryPolicy{MaxAttempts: 3, InitialBackoff: 10 * time.Millisecond, MaxBackoff: 50 * time.Millisecond},
+		// The tests' endpoints are httptest servers on 127.0.0.1.
+		AllowPrivateNetworks: true,
 	}
 }
 
@@ -136,7 +141,9 @@ func newFixture(t *testing.T) *fixture {
 		}
 	})
 
-	f := &fixture{t: t, ctx: context.Background(), svc: service.New(testPool, log), q: store.New(testPool), log: log, logs: logs}
+	// The service must accept 127.0.0.1 endpoint URLs for the test servers.
+	svc := service.New(testPool, log, service.WithEgressPolicy(safedial.Policy{AllowPrivate: true}))
+	f := &fixture{t: t, ctx: context.Background(), svc: svc, q: store.New(testPool), log: log, logs: logs}
 	tn, err := f.svc.CreateTenant(f.ctx, "Delivery "+uuid.NewString()[:8])
 	if err != nil {
 		t.Fatal(err)
@@ -148,11 +155,17 @@ func newFixture(t *testing.T) *fixture {
 
 func (f *fixture) endpoint(url string) uuid.UUID {
 	f.t.Helper()
+	id, _ := f.endpointWithSecret(url)
+	return id
+}
+
+func (f *fixture) endpointWithSecret(url string) (uuid.UUID, string) {
+	f.t.Helper()
 	ep, err := f.svc.CreateEndpoint(f.ctx, f.tenant, service.EndpointInput{URL: url})
 	if err != nil {
 		f.t.Fatal(err)
 	}
-	return ep.ID
+	return ep.ID, ep.Secret
 }
 
 // events submits n events and returns their ids.
@@ -913,6 +926,105 @@ func TestEndpointDeletedWhileAttemptIsInFlight(t *testing.T) {
 	f.waitStatus(5*time.Second, "succeeded", 1)
 	if !strings.Contains(f.logs.String(), "result discarded") {
 		t.Error("the result for the deleted delivery was not reported as discarded")
+	}
+	f.assertInvariant()
+}
+
+func verifier(t *testing.T, secrets ...string) *webhook.Verifier {
+	t.Helper()
+	v, err := webhook.NewVerifier(secrets...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+func TestDeliveredRequestsVerifyWithTheEndpointSecret(t *testing.T) {
+	f := newFixture(t)
+	srv, rec := newRecorder(t, nil)
+	_, secret := f.endpointWithSecret(srv.URL)
+	f.events(3)
+
+	f.start(testConfig("w-signed"))
+	f.waitStatus(5*time.Second, "succeeded", 3)
+
+	v := verifier(t, secret)
+	for i, h := range rec.all() {
+		if err := v.Verify(h.header, h.body); err != nil {
+			t.Errorf("request %d does not verify with the endpoint's secret: %v", i, err)
+		}
+	}
+}
+
+func TestSecretRotationOverlapsThenEnds(t *testing.T) {
+	f := newFixture(t)
+	srv, rec := newRecorder(t, nil)
+	ep, oldSecret := f.endpointWithSecret(srv.URL)
+
+	rotated, err := f.svc.RotateEndpointSecret(f.ctx, f.tenant, ep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newSecret := rotated.Secret
+
+	stop := f.start(testConfig("w-rotate"))
+	f.events(1)
+	f.waitFor(5*time.Second, "the first delivery", func() bool { return rec.count() == 1 })
+
+	// Inside the grace period: two signatures; either secret verifies.
+	h := rec.all()[0]
+	if n := len(strings.Fields(h.header.Get("Webhook-Signature"))); n != 2 {
+		t.Errorf("%d signatures during the grace period, want 2", n)
+	}
+	for name, s := range map[string]string{"old": oldSecret, "new": newSecret} {
+		if err := verifier(t, s).Verify(h.header, h.body); err != nil {
+			t.Errorf("the %s secret does not verify during the grace period: %v", name, err)
+		}
+	}
+
+	// The grace period ends: only the new secret signs.
+	if _, err := testPool.Exec(f.ctx, `UPDATE endpoints SET previous_secret_expires_at = now() - interval '1 second' WHERE id = $1`, ep); err != nil {
+		t.Fatal(err)
+	}
+	f.events(1)
+	f.waitFor(5*time.Second, "the second delivery", func() bool { return rec.count() == 2 })
+	stop()
+
+	h = rec.all()[1]
+	if n := len(strings.Fields(h.header.Get("Webhook-Signature"))); n != 1 {
+		t.Errorf("%d signatures after the grace period, want 1", n)
+	}
+	if err := verifier(t, newSecret).Verify(h.header, h.body); err != nil {
+		t.Errorf("the new secret does not verify: %v", err)
+	}
+	if err := verifier(t, oldSecret).Verify(h.header, h.body); err == nil {
+		t.Error("the old secret still verifies after its grace period")
+	}
+}
+
+// The worker's default transport enforces the destination policy at dial
+// time, whatever the API accepted when the endpoint was registered (think of
+// a hostname whose DNS later starts pointing inside the network).
+func TestPrivateDestinationsAreRefusedAtDialTime(t *testing.T) {
+	f := newFixture(t)
+	var reached atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached.Store(true) }))
+	t.Cleanup(srv.Close)
+	f.endpoint(srv.URL) // 127.0.0.1, registered through a permissive service
+	f.events(1)
+
+	cfg := testConfig("w-ssrf")
+	cfg.AllowPrivateNetworks = false
+	cfg.Retry.MaxAttempts = 1
+	f.start(cfg)
+	f.waitStatus(5*time.Second, "dead", 1)
+
+	if reached.Load() {
+		t.Fatal("the worker connected to a loopback address")
+	}
+	a := f.attempts(f.only().ID)
+	if len(a) != 1 || a[0].Error == nil || !strings.Contains(*a[0].Error, "not allowed: loopback") {
+		t.Errorf("the attempt should record the refusal: %+v", a)
 	}
 	f.assertInvariant()
 }

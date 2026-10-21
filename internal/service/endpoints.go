@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/burakcelik1061-star/hook-mini/internal/credential"
+	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
 	"github.com/burakcelik1061-star/hook-mini/internal/store"
 )
 
@@ -30,7 +32,7 @@ type EndpointPatch struct {
 // the caller; reads return the store struct too, but the HTTP layer never
 // serialises it.
 func (s *Service) CreateEndpoint(ctx context.Context, tenantID uuid.UUID, in EndpointInput) (store.Endpoint, error) {
-	if err := ValidateEndpointURL(in.URL); err != nil {
+	if err := s.validateDestination(in.URL); err != nil {
 		return store.Endpoint{}, err
 	}
 	if err := validateDescription(in.Description); err != nil {
@@ -46,6 +48,50 @@ func (s *Service) CreateEndpoint(ctx context.Context, tenantID uuid.UUID, in End
 	})
 	if err != nil {
 		return store.Endpoint{}, fmt.Errorf("create endpoint: %w", err)
+	}
+	return ep, nil
+}
+
+// validateDestination checks the URL's syntax and then rejects destinations
+// that are blocked without any DNS lookup (private IP literals, localhost).
+// This is only the early, friendly check: the worker checks the resolved
+// address again on every connection.
+func (s *Service) validateDestination(raw string) error {
+	if err := ValidateEndpointURL(raw); err != nil {
+		return err
+	}
+	u, _ := url.Parse(raw) // cannot fail after ValidateEndpointURL
+	if err := s.egress.CheckHost(u.Hostname()); err != nil {
+		var be *safedial.BlockedError
+		if errors.As(err, &be) {
+			return invalid("url", "points to a destination that is not allowed (%s)", be.Reason)
+		}
+		return invalid("url", "points to a destination that is not allowed")
+	}
+	return nil
+}
+
+// SecretRotationGrace is how long the previous signing secret keeps working
+// after a rotation.
+const SecretRotationGrace = 24 * time.Hour
+
+// RotateEndpointSecret gives an endpoint a new signing secret. For
+// SecretRotationGrace requests are signed with both the new and the old
+// secret, so the receiver can switch over without rejecting anything. The new
+// secret is returned in the endpoint and, as at creation, shown only here.
+func (s *Service) RotateEndpointSecret(ctx context.Context, tenantID, id uuid.UUID) (store.Endpoint, error) {
+	secret, err := credential.NewSigningSecret()
+	if err != nil {
+		return store.Endpoint{}, err
+	}
+	ep, err := s.q.RotateEndpointSecret(ctx, store.RotateEndpointSecretParams{
+		ID: id, TenantID: tenantID, NewSecret: secret, GraceMs: SecretRotationGrace.Milliseconds(),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.Endpoint{}, ErrNotFound
+	}
+	if err != nil {
+		return store.Endpoint{}, fmt.Errorf("rotate secret: %w", err)
 	}
 	return ep, nil
 }
@@ -83,7 +129,7 @@ func (s *Service) UpdateEndpoint(ctx context.Context, tenantID, id uuid.UUID, p 
 		return store.Endpoint{}, invalid("body", "must contain at least one of url, description")
 	}
 	if p.URL != nil {
-		if err := ValidateEndpointURL(*p.URL); err != nil {
+		if err := s.validateDestination(*p.URL); err != nil {
 			return store.Endpoint{}, err
 		}
 	}

@@ -302,6 +302,59 @@ func TestEndpointLifecycleOverHTTP(t *testing.T) {
 	}
 }
 
+func TestSecretRotationOverHTTP(t *testing.T) {
+	srv, svc := newServer(t)
+	a, b := newTenantClient(t, srv, svc), newTenantClient(t, srv, svc)
+	created := a.createEndpoint("https://example.invalid/rotate")
+	id, oldSecret := created["id"].(string), created["secret"].(string)
+
+	res := a.send("POST", "/v1/endpoints/"+id+"/rotate-secret", nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("rotate: %d %s", res.StatusCode, res.Body)
+	}
+	body := res.JSON()
+	newSecret, _ := body["secret"].(string)
+	if !strings.HasPrefix(newSecret, "whsec_") || newSecret == oldSecret {
+		t.Errorf("rotation did not return a fresh secret: %s", res.Body)
+	}
+	if _, ok := body["previous_secret_expires_at"]; !ok {
+		t.Errorf("rotation response lacks previous_secret_expires_at: %s", res.Body)
+	}
+	if strings.Contains(string(res.Body), oldSecret) {
+		t.Error("the rotation response contains the previous secret")
+	}
+	if res.Header.Get("Cache-Control") != "no-store" {
+		t.Error("a response with a secret must not be cacheable")
+	}
+
+	got := a.send("GET", "/v1/endpoints/"+id, nil)
+	if strings.Contains(string(got.Body), "whsec_") || !strings.Contains(string(got.Body), "previous_secret_expires_at") {
+		t.Errorf("GET after rotation: %s", got.Body)
+	}
+
+	if r := b.send("POST", "/v1/endpoints/"+id+"/rotate-secret", nil); r.StatusCode != http.StatusNotFound {
+		t.Errorf("rotation by another tenant: %d, want 404", r.StatusCode)
+	}
+	if r := a.send("GET", "/v1/endpoints/"+id+"/rotate-secret", nil); r.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("GET on rotate-secret: %d, want 405", r.StatusCode)
+	}
+}
+
+func TestPrivateDestinationsAreRejectedOverHTTP(t *testing.T) {
+	srv, svc := newServer(t)
+	c := newTenantClient(t, srv, svc)
+	for _, u := range []string{"http://127.0.0.1:5432/", "http://localhost/", "http://169.254.169.254/latest/meta-data/", "http://[::1]:8080/", "http://10.1.2.3/"} {
+		res := c.send("POST", "/v1/endpoints", map[string]any{"url": u})
+		if res.StatusCode != http.StatusBadRequest || res.errorCode() != "invalid_request" {
+			t.Errorf("%s: %d %s, want 400", u, res.StatusCode, res.Body)
+			continue
+		}
+		if e := res.JSON()["error"].(map[string]any); e["field"] != "url" || !strings.Contains(e["message"].(string), "not allowed") {
+			t.Errorf("%s: %s", u, res.Body)
+		}
+	}
+}
+
 func TestTenantsAreIsolatedOverHTTP(t *testing.T) {
 	srv, svc := newServer(t)
 	a, b := newTenantClient(t, srv, svc), newTenantClient(t, srv, svc)

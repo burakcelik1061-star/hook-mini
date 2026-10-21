@@ -110,6 +110,9 @@ type Querier interface {
 	RecordLostAttempts(ctx context.Context, arg RecordLostAttemptsParams) error
 	// Returns no row if the key does not exist for this tenant or is already revoked.
 	RevokeAPIKey(ctx context.Context, arg RevokeAPIKeyParams) (uuid.UUID, error)
+	// The current secret becomes the previous one, valid for grace_ms more; a
+	// second rotation inside that window drops the oldest secret.
+	RotateEndpointSecret(ctx context.Context, arg RotateEndpointSecretParams) (Endpoint, error)
 	ScheduleDeliveryRetry(ctx context.Context, arg ScheduleDeliveryRetryParams) (int64, error)
 	// Throttled to one write per minute per key, so authenticating a request does
 	// not turn into a write on a hot row.

@@ -12,19 +12,34 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
 	"github.com/burakcelik1061-star/hook-mini/internal/store"
 )
 
 // Service implements the use cases. It is safe for concurrent use.
 type Service struct {
-	pool *pgxpool.Pool
-	q    *store.Queries
-	log  *slog.Logger
+	pool   *pgxpool.Pool
+	q      *store.Queries
+	log    *slog.Logger
+	egress safedial.Policy
+}
+
+// Option configures a Service.
+type Option func(*Service)
+
+// WithEgressPolicy sets which destinations endpoint URLs may point at. The
+// default refuses private, loopback and link-local addresses.
+func WithEgressPolicy(p safedial.Policy) Option {
+	return func(s *Service) { s.egress = p }
 }
 
 // New returns a Service backed by pool.
-func New(pool *pgxpool.Pool, log *slog.Logger) *Service {
-	return &Service{pool: pool, q: store.New(pool), log: log}
+func New(pool *pgxpool.Pool, log *slog.Logger, opts ...Option) *Service {
+	s := &Service{pool: pool, q: store.New(pool), log: log}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
 }
 
 // Sentinel errors. The HTTP layer maps each one to a status code; anything

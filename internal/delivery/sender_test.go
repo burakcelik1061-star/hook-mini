@@ -7,18 +7,30 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
+	"github.com/burakcelik1061-star/hook-mini/pkg/webhook"
 )
+
+// testSecret is the Standard Webhooks specification's example secret.
+const testSecret = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"
+
+// allowAll is a transport that may reach the tests' loopback servers. The
+// production default refuses them (see TestDefaultSenderRefusesLoopback).
+func allowAll() *http.Transport { return safedial.Policy{AllowPrivate: true}.Transport() }
 
 func testMessage(t *testing.T, url string) (message, uuid.UUID) {
 	t.Helper()
 	id := uuid.New()
-	m, err := newMessage(url, id, "invoice.paid", time.Date(2026, 10, 21, 12, 0, 0, 123000000, time.FixedZone("TRT", 3*3600)), json.RawMessage(`{"amount":42}`))
+	m, err := newMessage(url, id, "invoice.paid", time.Date(2026, 10, 21, 12, 0, 0, 123000000, time.FixedZone("TRT", 3*3600)), json.RawMessage(`{"amount":42}`), testSecret)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,7 +48,7 @@ func TestSendRequestShape(t *testing.T) {
 	defer srv.Close()
 
 	m, id := testMessage(t, srv.URL+"/hooks?x=1")
-	res := newSender(nil, time.Second).send(context.Background(), m)
+	res := newSender(allowAll(), time.Second).send(context.Background(), m)
 
 	if !res.ok() || res.statusCode != 200 || res.snippet != "thanks" || res.errText != "" {
 		t.Fatalf("unexpected result: %+v", res)
@@ -70,6 +82,130 @@ func TestSendRequestShape(t *testing.T) {
 	}
 }
 
+// captureServer records the last request's headers and body.
+func captureServer(t *testing.T) (*httptest.Server, func() (http.Header, []byte)) {
+	t.Helper()
+	var (
+		mu   sync.Mutex
+		hdr  http.Header
+		body []byte
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		hdr, body = r.Header.Clone(), b
+		mu.Unlock()
+	}))
+	t.Cleanup(srv.Close)
+	return srv, func() (http.Header, []byte) {
+		mu.Lock()
+		defer mu.Unlock()
+		return hdr, body
+	}
+}
+
+func TestRequestsAreSignedPerStandardWebhooks(t *testing.T) {
+	srv, last := captureServer(t)
+	m, id := testMessage(t, srv.URL)
+	if res := newSender(allowAll(), time.Second).send(context.Background(), m); !res.ok() {
+		t.Fatalf("send: %+v", res)
+	}
+	h, body := last()
+
+	if h.Get("Webhook-Id") != id.String() {
+		t.Errorf("webhook-id = %q, want the event id", h.Get("Webhook-Id"))
+	}
+	ts, err := strconv.ParseInt(h.Get("Webhook-Timestamp"), 10, 64)
+	if err != nil || time.Since(time.Unix(ts, 0)).Abs() > 5*time.Second {
+		t.Errorf("webhook-timestamp = %q, want the current Unix time", h.Get("Webhook-Timestamp"))
+	}
+	if sig := h.Get("Webhook-Signature"); !strings.HasPrefix(sig, "v1,") || len(strings.Fields(sig)) != 1 {
+		t.Errorf("webhook-signature = %q, want one v1 signature", sig)
+	}
+
+	// The receiver side of the standard accepts it...
+	v, _ := webhook.NewVerifier(testSecret)
+	if err := v.Verify(h, body); err != nil {
+		t.Fatalf("a receiver with the secret rejects the request: %v", err)
+	}
+	// ...and a receiver with another secret does not.
+	other, _ := webhook.NewVerifier("whsec_" + strings.Repeat("Q", 32))
+	if err := other.Verify(h, body); err == nil {
+		t.Error("a receiver with the wrong secret accepted the request")
+	}
+}
+
+func TestRotationSignsWithBothSecrets(t *testing.T) {
+	srv, last := captureServer(t)
+	newSecret := "whsec_" + "bmV3LXNlY3JldC1mb3ItdGhlLXJvdGF0aW9uLXRlc3Q="
+	m, err := newMessage(srv.URL, uuid.New(), "a.b", time.Now(), json.RawMessage(`{}`), newSecret, testSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newSender(allowAll(), time.Second).send(context.Background(), m)
+	h, body := last()
+
+	if n := len(strings.Fields(h.Get("Webhook-Signature"))); n != 2 {
+		t.Fatalf("%d signatures, want 2 during a rotation", n)
+	}
+	for _, secret := range []string{newSecret, testSecret} {
+		v, _ := webhook.NewVerifier(secret)
+		if err := v.Verify(h, body); err != nil {
+			t.Errorf("a receiver with %s... rejects the rotated request: %v", secret[:10], err)
+		}
+	}
+}
+
+func TestEachAttemptIsSignedAtItsOwnTime(t *testing.T) {
+	srv, last := captureServer(t)
+	m, _ := testMessage(t, srv.URL)
+	s := newSender(allowAll(), time.Second)
+
+	clock := time.Unix(1_800_000_000, 0)
+	s.now = func() time.Time { return clock }
+	s.send(context.Background(), m)
+	h1, _ := last()
+
+	clock = clock.Add(3 * time.Hour) // a retry much later
+	s.send(context.Background(), m)
+	h2, _ := last()
+
+	if h1.Get("Webhook-Timestamp") == h2.Get("Webhook-Timestamp") || h1.Get("Webhook-Signature") == h2.Get("Webhook-Signature") {
+		t.Error("a retry reused the first attempt's timestamp and signature; receivers would reject it as a replay")
+	}
+	if h1.Get("Webhook-Id") != h2.Get("Webhook-Id") {
+		t.Error("webhook-id changed between retries; receivers could not deduplicate")
+	}
+}
+
+func TestNewMessageRejectsBadSecrets(t *testing.T) {
+	if _, err := newMessage("http://x.invalid", uuid.New(), "a.b", time.Now(), json.RawMessage(`{}`)); err == nil {
+		t.Error("a message without a signing secret was accepted")
+	}
+	_, err := newMessage("http://x.invalid", uuid.New(), "a.b", time.Now(), json.RawMessage(`{}`), "whsec_not*base64")
+	if err == nil {
+		t.Fatal("a corrupt secret was accepted")
+	}
+	if strings.Contains(err.Error(), "not*base64") {
+		t.Errorf("the error repeats the secret: %v", err)
+	}
+}
+
+func TestDefaultSenderRefusesLoopback(t *testing.T) {
+	var reached atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached.Store(true) }))
+	defer srv.Close()
+
+	m, _ := testMessage(t, srv.URL)
+	res := newSender(nil, time.Second).send(context.Background(), m)
+	if res.ok() || !strings.Contains(res.errText, "not allowed: loopback") {
+		t.Errorf("unexpected result: %+v", res)
+	}
+	if reached.Load() {
+		t.Error("the default sender reached a loopback server")
+	}
+}
+
 func TestSendNon2xxIsAFailure(t *testing.T) {
 	// (1xx cannot be tested this way: Go's server sends it as an interim
 	// response and then a 200.)
@@ -78,7 +214,7 @@ func TestSendNon2xxIsAFailure(t *testing.T) {
 			w.WriteHeader(code)
 		}))
 		m, _ := testMessage(t, srv.URL)
-		res := newSender(nil, time.Second).send(context.Background(), m)
+		res := newSender(allowAll(), time.Second).send(context.Background(), m)
 		srv.Close()
 		if res.ok() || res.statusCode != code || !strings.Contains(res.errText, "HTTP") {
 			t.Errorf("status %d: %+v, want a failure carrying the code", code, res)
@@ -89,7 +225,7 @@ func TestSendNon2xxIsAFailure(t *testing.T) {
 			w.WriteHeader(code)
 		}))
 		m, _ := testMessage(t, srv.URL)
-		res := newSender(nil, time.Second).send(context.Background(), m)
+		res := newSender(allowAll(), time.Second).send(context.Background(), m)
 		srv.Close()
 		if !res.ok() {
 			t.Errorf("status %d is a success: %+v", code, res)
@@ -106,7 +242,7 @@ func TestSendDoesNotFollowRedirects(t *testing.T) {
 			http.Redirect(w, r, target.URL, code)
 		}))
 		m, _ := testMessage(t, redirector.URL)
-		res := newSender(nil, time.Second).send(context.Background(), m)
+		res := newSender(allowAll(), time.Second).send(context.Background(), m)
 		redirector.Close()
 		if res.ok() || res.statusCode != code {
 			t.Errorf("%d: %+v, want a failure with the redirect status", code, res)
@@ -131,7 +267,7 @@ func TestSendTimeout(t *testing.T) {
 
 	m, _ := testMessage(t, srv.URL)
 	start := time.Now()
-	res := newSender(nil, 200*time.Millisecond).send(context.Background(), m)
+	res := newSender(allowAll(), 200*time.Millisecond).send(context.Background(), m)
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("send took %s, the timeout was not enforced", elapsed)
 	}
@@ -157,7 +293,7 @@ func TestSendTimeoutCoversASlowBody(t *testing.T) {
 	defer srv.Close()
 	m, _ := testMessage(t, srv.URL)
 	start := time.Now()
-	res := newSender(nil, 300*time.Millisecond).send(context.Background(), m)
+	res := newSender(allowAll(), 300*time.Millisecond).send(context.Background(), m)
 	if time.Since(start) > 2*time.Second {
 		t.Fatal("a never-ending body kept the attempt open past the timeout")
 	}
@@ -176,7 +312,7 @@ func TestSendConnectionRefused(t *testing.T) {
 	ln.Close() // nothing listens there now
 
 	m, _ := testMessage(t, "http://"+addr)
-	res := newSender(nil, time.Second).send(context.Background(), m)
+	res := newSender(allowAll(), time.Second).send(context.Background(), m)
 	if res.ok() || res.statusCode != 0 || !strings.Contains(res.errText, "refused") {
 		t.Errorf("unexpected result: %+v", res)
 	}
@@ -192,7 +328,7 @@ func TestSendReadsRetryAfterOnlyFor429And503(t *testing.T) {
 			w.WriteHeader(code)
 		}))
 		m, _ := testMessage(t, srv.URL)
-		res := newSender(nil, time.Second).send(context.Background(), m)
+		res := newSender(allowAll(), time.Second).send(context.Background(), m)
 		srv.Close()
 		if res.retryAfter != want {
 			t.Errorf("%d: retryAfter = %s, want %s", code, res.retryAfter, want)
@@ -207,7 +343,7 @@ func TestSendLimitsAndCleansTheSnippet(t *testing.T) {
 	}))
 	defer srv.Close()
 	m, _ := testMessage(t, srv.URL)
-	res := newSender(nil, time.Second).send(context.Background(), m)
+	res := newSender(allowAll(), time.Second).send(context.Background(), m)
 	if res.statusCode != 500 || len([]rune(res.snippet)) > maxSnippetRunes || strings.ContainsRune(res.snippet, 0) {
 		t.Errorf("snippet not limited/cleaned: status %d, %d runes", res.statusCode, len([]rune(res.snippet)))
 	}
@@ -224,7 +360,7 @@ func TestSendIgnoresProxyEnvironment(t *testing.T) {
 	t.Setenv("http_proxy", proxy.URL)
 	// Point the request at a non-loopback name so Go's own "no proxy for
 	// localhost" rule cannot be what keeps the proxy out of the way.
-	tr := defaultTransport()
+	tr := allowAll()
 	tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
 		var d net.Dialer
 		return d.DialContext(ctx, network, strings.TrimPrefix(target.URL, "http://"))

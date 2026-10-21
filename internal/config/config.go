@@ -28,6 +28,9 @@ type Config struct {
 	// ShutdownTimeout bounds how long a process waits for in-flight work to
 	// finish after receiving a termination signal.
 	ShutdownTimeout time.Duration
+	// AllowPrivateDestinations lets endpoints point at loopback, private and
+	// link-local addresses. Only for local development; never in production.
+	AllowPrivateDestinations bool
 	// Worker holds the delivery worker's settings.
 	Worker Worker
 }
@@ -105,6 +108,14 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 
 	cfg.ShutdownTimeout = duration("SHUTDOWN_TIMEOUT", "15s", time.Second, 10*time.Minute)
+
+	switch v := strings.ToLower(get("ALLOW_PRIVATE_DESTINATIONS", "false")); v {
+	case "true", "1":
+		cfg.AllowPrivateDestinations = true
+	case "false", "0":
+	default:
+		fail("ALLOW_PRIVATE_DESTINATIONS must be true or false, got %q", v)
+	}
 
 	w := Worker{
 		ID:             get("WORKER_ID", ""),

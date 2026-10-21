@@ -59,6 +59,7 @@ func NewRouter(d Deps) http.Handler {
 				r.Get("/{id}", h.getEndpoint)
 				r.Patch("/{id}", h.updateEndpoint)
 				r.Delete("/{id}", h.deleteEndpoint)
+				r.Post("/{id}/rotate-secret", h.rotateSecret)
 			})
 			r.Route("/events", func(r chi.Router) {
 				r.Post("/", h.createEvent)

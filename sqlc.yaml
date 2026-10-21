@@ -34,6 +34,8 @@ sql:
           # marshals a store struct directly, these fields are left out.
           - column: "endpoints.secret"
             go_struct_tag: 'json:"-"'
+          - column: "endpoints.previous_secret"
+            go_struct_tag: 'json:"-"'
           - column: "api_keys.key_hash"
             go_struct_tag: 'json:"-"'
           - db_type: text

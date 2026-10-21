@@ -25,6 +25,10 @@ services:
     environment: &app-env
       DATABASE_URL: postgres://hookmini:hookmini@postgres:5432/hookmini?sslmode=disable
       LOG_FORMAT: text
+      # Off by default: endpoints may not point at private addresses. The demo
+      # receiver lives on the Docker network (a private address), so the demo
+      # turns this on: ALLOW_PRIVATE_DESTINATIONS=true docker compose --profile demo up -d
+      ALLOW_PRIVATE_DESTINATIONS: ${ALLOW_PRIVATE_DESTINATIONS:-false}
     depends_on:
       postgres:
         condition: service_healthy
@@ -55,11 +59,14 @@ services:
 
   # Development-only webhook endpoint that logs what it receives. Start it
   # with `docker compose --profile demo up -d` and register
-  # http://receiver:9000/anything (or /status/503 to watch retries).
+  # http://receiver:9000/anything (or /status/503 to watch retries). Set
+  # RECEIVER_SECRETS to an endpoint's secret to have signatures verified.
   receiver:
     image: hook-mini:dev
     command: ["receiver"]
     profiles: ["demo"]
+    environment:
+      RECEIVER_SECRETS: ${RECEIVER_SECRETS:-}
     ports:
       - "127.0.0.1:9000:9000"
 

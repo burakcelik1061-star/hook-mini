@@ -44,6 +44,11 @@ RETURNING d.id,
           e.created_at        AS event_created_at,
           ep.url              AS endpoint_url,
           ep.secret           AS endpoint_secret,
+          -- During a rotation's grace period requests carry a second
+          -- signature made with the previous secret. Whether the grace
+          -- period is still running is decided by the database clock.
+          ep.previous_secret  AS endpoint_previous_secret,
+          COALESCE(ep.previous_secret_expires_at > now(), false)::boolean AS previous_secret_valid,
           ep.status           AS endpoint_status
 `
 
@@ -54,18 +59,20 @@ type ClaimDueDeliveriesParams struct {
 }
 
 type ClaimDueDeliveriesRow struct {
-	ID             uuid.UUID
-	TenantID       uuid.UUID
-	EventID        uuid.UUID
-	EndpointID     uuid.UUID
-	AttemptCount   int32
-	LeaseToken     uuid.UUID
-	EventType      string
-	EventPayload   json.RawMessage
-	EventCreatedAt time.Time
-	EndpointUrl    string
-	EndpointSecret string `json:"-"`
-	EndpointStatus string
+	ID                     uuid.UUID
+	TenantID               uuid.UUID
+	EventID                uuid.UUID
+	EndpointID             uuid.UUID
+	AttemptCount           int32
+	LeaseToken             uuid.UUID
+	EventType              string
+	EventPayload           json.RawMessage
+	EventCreatedAt         time.Time
+	EndpointUrl            string
+	EndpointSecret         string  `json:"-"`
+	EndpointPreviousSecret *string `json:"-"`
+	PreviousSecretValid    bool
+	EndpointStatus         string
 }
 
 // Queries used only by the delivery worker.
@@ -113,6 +120,8 @@ func (q *Queries) ClaimDueDeliveries(ctx context.Context, arg ClaimDueDeliveries
 			&i.EventCreatedAt,
 			&i.EndpointUrl,
 			&i.EndpointSecret,
+			&i.EndpointPreviousSecret,
+			&i.PreviousSecretValid,
 			&i.EndpointStatus,
 		); err != nil {
 			return nil, err

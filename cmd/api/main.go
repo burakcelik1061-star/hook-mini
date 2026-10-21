@@ -13,6 +13,7 @@ import (
 	"github.com/burakcelik1061-star/hook-mini/internal/httpapi"
 	"github.com/burakcelik1061-star/hook-mini/internal/lifecycle"
 	"github.com/burakcelik1061-star/hook-mini/internal/logging"
+	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
 	"github.com/burakcelik1061-star/hook-mini/internal/service"
 )
 
@@ -39,12 +40,17 @@ func run() error {
 	}
 	defer pool.Close()
 
+	if cfg.AllowPrivateDestinations {
+		log.Warn("ALLOW_PRIVATE_DESTINATIONS is on: endpoints may point at private and loopback addresses; never use this in production")
+	}
+	svc := service.New(pool, log, service.WithEgressPolicy(safedial.Policy{AllowPrivate: cfg.AllowPrivateDestinations}))
+
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.HTTPAddr, err)
 	}
 	srv := &http.Server{
-		Handler:           httpapi.NewRouter(httpapi.Deps{Log: log, DB: pool, Svc: service.New(pool, log)}),
+		Handler:           httpapi.NewRouter(httpapi.Deps{Log: log, DB: pool, Svc: svc}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,

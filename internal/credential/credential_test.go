@@ -1,6 +1,7 @@
 package credential
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -96,5 +97,11 @@ func TestSigningSecret(t *testing.T) {
 	// The database requires at least 24 characters; ours carry 256 bits.
 	if len(a) < 24+len(SigningSecretPrefix) {
 		t.Errorf("secret is only %d characters", len(a))
+	}
+	// Standard Webhooks libraries decode the part after "whsec_" as
+	// standard base64; it must come out as the full 32-byte key.
+	key, err := base64.StdEncoding.Strict().DecodeString(strings.TrimPrefix(a, SigningSecretPrefix))
+	if err != nil || len(key) != 32 {
+		t.Errorf("secret %q is not standard base64 of 32 bytes (%d bytes, err=%v)", a, len(key), err)
 	}
 }

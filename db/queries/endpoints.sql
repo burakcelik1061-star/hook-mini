@@ -58,6 +58,16 @@ UPDATE endpoints
 SET status = 'disabled', disabled_at = now(), disabled_reason = $2
 WHERE id = $1 AND status = 'active';
 
+-- name: RotateEndpointSecret :one
+-- The current secret becomes the previous one, valid for grace_ms more; a
+-- second rotation inside that window drops the oldest secret.
+UPDATE endpoints
+SET previous_secret            = secret,
+    previous_secret_expires_at = now() + sqlc.arg(grace_ms)::bigint * interval '1 millisecond',
+    secret                     = sqlc.arg(new_secret)::text
+WHERE id = sqlc.arg(id) AND tenant_id = sqlc.arg(tenant_id)
+RETURNING *;
+
 -- name: EnableEndpoint :one
 UPDATE endpoints
 SET status = 'active', disabled_at = NULL, disabled_reason = NULL, consecutive_failures = 0

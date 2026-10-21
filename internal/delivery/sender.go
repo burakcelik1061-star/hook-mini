@@ -10,11 +10,15 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+
+	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
+	"github.com/burakcelik1061-star/hook-mini/pkg/webhook"
 )
 
 const (
@@ -45,14 +49,30 @@ type message struct {
 	url     string
 	eventID uuid.UUID
 	body    []byte
+	// keys sign the request; more than one while a secret is being rotated.
+	keys [][]byte
 }
 
-func newMessage(url string, eventID uuid.UUID, eventType string, createdAt time.Time, payload json.RawMessage) (message, error) {
+// newMessage builds the request body and decodes the signing secrets (the
+// current one first). It fails only on a corrupt secret or payload, which a
+// retry cannot fix.
+func newMessage(url string, eventID uuid.UUID, eventType string, createdAt time.Time, payload json.RawMessage, secrets ...string) (message, error) {
+	if len(secrets) == 0 {
+		return message{}, errors.New("no signing secret")
+	}
+	keys := make([][]byte, len(secrets))
+	for i, s := range secrets {
+		k, err := webhook.DecodeSecret(s)
+		if err != nil {
+			return message{}, fmt.Errorf("signing secret %d: %w", i+1, err)
+		}
+		keys[i] = k
+	}
 	body, err := json.Marshal(envelope{ID: eventID, Type: eventType, CreatedAt: createdAt.UTC(), Data: payload})
 	if err != nil {
 		return message{}, fmt.Errorf("encode envelope: %w", err)
 	}
-	return message{url: url, eventID: eventID, body: body}, nil
+	return message{url: url, eventID: eventID, body: body, keys: keys}, nil
 }
 
 // result is what came back from one attempt.
@@ -74,9 +94,11 @@ type sender struct {
 	now     func() time.Time
 }
 
+// newSender returns a sender using transport; nil means the default
+// transport, which refuses private destinations (safe by default).
 func newSender(transport http.RoundTripper, timeout time.Duration) *sender {
 	if transport == nil {
-		transport = defaultTransport()
+		transport = safedial.Policy{}.Transport()
 	}
 	return &sender{
 		client: &http.Client{
@@ -90,16 +112,6 @@ func newSender(transport http.RoundTripper, timeout time.Duration) *sender {
 		timeout: timeout,
 		now:     time.Now,
 	}
-}
-
-// defaultTransport is a plain transport that ignores HTTP_PROXY and friends:
-// webhook traffic goes straight to the endpoint, never through a proxy picked
-// up from the worker's environment.
-func defaultTransport() *http.Transport {
-	t := http.DefaultTransport.(*http.Transport).Clone()
-	t.Proxy = nil
-	t.MaxIdleConnsPerHost = 16
-	return t
 }
 
 // send makes one attempt. The whole exchange, reading the response included,
@@ -118,9 +130,14 @@ func (s *sender) send(ctx context.Context, m message) result {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", userAgent)
-	// Stable across retries of the same event, so a receiver can drop
-	// duplicates (Standard Webhooks "webhook-id").
-	req.Header.Set("Webhook-Id", m.eventID.String())
+	// Standard Webhooks headers. The id is stable across retries of the same
+	// event, so a receiver can drop duplicates. The timestamp and signature
+	// are made fresh for every attempt: a retry hours later must still fall
+	// inside the receiver's replay window.
+	id, signedAt := m.eventID.String(), s.now()
+	req.Header.Set(webhook.HeaderID, id)
+	req.Header.Set(webhook.HeaderTimestamp, strconv.FormatInt(signedAt.Unix(), 10))
+	req.Header.Set(webhook.HeaderSignature, webhook.SignatureHeader(m.keys, id, signedAt, m.body))
 
 	resp, err := s.client.Do(req)
 	if err != nil {

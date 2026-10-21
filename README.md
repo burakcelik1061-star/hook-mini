@@ -4,10 +4,10 @@ A small webhook delivery service: applications send events, Hook Mini delivers
 them to subscriber endpoints with signed requests, retries and a delivery
 history. Think Svix, scaled down to something you can read in an afternoon.
 
-> **Status: Phase 3 (delivery).** Events are delivered to their endpoints by
-> workers, with retries, exponential backoff and dead-lettering. **Requests
-> are not signed yet and private-network targets are not blocked yet**; both
-> arrive in Phase 4, so do not point this at untrusted URLs. See
+> **Status: Phase 4 (security).** Events are delivered by workers with retries
+> and dead-lettering, every request is signed in the
+> [Standard Webhooks](https://www.standardwebhooks.com) format, and private,
+> loopback and cloud-metadata destinations are refused at connect time. See
 > [Roadmap](#roadmap).
 
 ## Architecture
@@ -87,10 +87,11 @@ Each attempt is a `POST` with this body and headers:
 {"id": "<event id>", "type": "invoice.paid", "created_at": "2026-10-21T09:00:00Z", "data": {"amount": 42}}
 ```
 
-`Content-Type: application/json`, `User-Agent: HookMini/1.0`, and
-`Webhook-Id: <event id>`, which is identical on every retry so receivers can
-drop duplicates. A `2xx` is a success; anything else, a timeout or a connection
-error is a failure. Redirects are not followed.
+`Content-Type: application/json`, `User-Agent: HookMini/1.0`, and the three
+Standard Webhooks headers: `webhook-id` (the event id, identical on every retry
+so receivers can drop duplicates), `webhook-timestamp` and `webhook-signature`
+(see [Security](#security)). A `2xx` is a success; anything else, a timeout or
+a connection error is a failure. Redirects are not followed.
 
 **Guarantees.** Delivery is *at least once*.
 
@@ -117,6 +118,49 @@ a wait, never shorten it. All times come from the database clock.
 | `DELIVERY_TIMEOUT` | `15s` | one attempt, reading the response included |
 | `DELIVERY_MAX_ATTEMPTS` | `8` | |
 | `DELIVERY_BACKOFF_INITIAL` / `_MAX` | `30s` / `6h` | |
+
+## Security
+
+### Verifying a webhook
+
+Requests are signed per [Standard Webhooks](https://www.standardwebhooks.com):
+the signed content is `<webhook-id>.<webhook-timestamp>.<raw body>`, the
+signature is `v1,<base64 HMAC-SHA256>` with the endpoint's `whsec_...` secret.
+Any Standard Webhooks library verifies it; in Go, `pkg/webhook` does:
+
+```go
+v, err := webhook.NewVerifier(os.Getenv("WEBHOOK_SECRET")) // the endpoint's whsec_... secret
+// in the handler, with the body exactly as received:
+body, _ := io.ReadAll(r.Body)
+if err := v.Verify(r.Header, body); err != nil {
+	http.Error(w, "invalid signature", http.StatusUnauthorized)
+	return
+}
+```
+
+`Verify` rejects timestamps more than 5 minutes off (replays) and compares in
+constant time. Every attempt is signed afresh, so a retry hours later is not
+mistaken for a replay. The implementation is tested against the
+specification's published example.
+
+**Rotation.** `POST /v1/endpoints/{id}/rotate-secret` returns a new secret
+(once). For 24 hours requests carry two signatures, one per secret, so the
+receiver can switch whenever it is ready without rejecting a delivery.
+
+### Destinations
+
+A tenant controls endpoint URLs, so without care the worker would send
+requests wherever they point: `http://169.254.169.254/` (cloud credentials),
+`http://localhost:5432/`, the internal network. `internal/safedial` checks the
+**resolved IP of every connection**, after DNS, via `net.Dialer.Control`, so a
+hostname that later starts resolving inside (DNS rebinding) is refused too.
+Blocked: loopback, private, link-local, CGNAT, multicast, reserved ranges, and
+IPv6 forms that embed an IPv4 address (`::ffff:`, NAT64, 6to4, Teredo).
+Registration also rejects IP literals and `localhost` early with a clear
+error. Proxies from the environment are ignored and redirects never followed.
+
+`ALLOW_PRIVATE_DESTINATIONS=true` lifts this for local development only; api
+and worker log a warning when it is on.
 
 ## Quick start
 
@@ -161,16 +205,23 @@ curl localhost:8080/readyz
 
 ### Watching deliveries locally
 
-A development receiver logs every webhook it gets. Start it, with short
-retries so failures are quick to watch:
+A development receiver logs every webhook it gets. It lives on the Docker
+network (a private address), so the demo allows private destinations, and
+uses short retries so failures are quick to watch:
 
 ```bash
-DELIVERY_BACKOFF_INITIAL=1s DELIVERY_MAX_ATTEMPTS=3 docker compose --profile demo up -d --build
+ALLOW_PRIVATE_DESTINATIONS=true DELIVERY_BACKOFF_INITIAL=1s DELIVERY_MAX_ATTEMPTS=3 docker compose --profile demo up -d --build
 ```
 
 Register `http://receiver:9000/billing` (answers 200) and
-`http://receiver:9000/status/503` (always fails) as endpoints, submit an event,
-then:
+`http://receiver:9000/status/503` (always fails) as endpoints. To have the
+receiver verify signatures, restart it with an endpoint's secret:
+
+```bash
+RECEIVER_SECRETS=whsec_... ALLOW_PRIVATE_DESTINATIONS=true docker compose --profile demo up -d receiver
+```
+
+Submit an event, then:
 
 ```bash
 docker compose logs -f receiver worker
@@ -186,6 +237,7 @@ All `/v1` routes need `Authorization: Bearer <api key>`. Bodies are JSON.
 | `GET /v1/endpoints` | List endpoints (newest first, paginated). |
 | `GET /v1/endpoints/{id}` | One endpoint. |
 | `PATCH /v1/endpoints/{id}` | Change `url` and/or `description`. |
+| `POST /v1/endpoints/{id}/rotate-secret` | New signing secret (returned once); the old one keeps signing for 24h. |
 | `DELETE /v1/endpoints/{id}` | Delete an endpoint and its delivery history. `204`. |
 | `POST /v1/events` | Submit an event. `201` when new, `200` on an idempotent replay. |
 | `GET /v1/events` | List events (newest first, paginated). |
@@ -282,8 +334,8 @@ go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate
 | 0 | Foundation |
 | 1 | Data model and generated queries |
 | 2 | API keys, endpoints, event ingestion with idempotency |
-| 3 | Queue, worker, retries with backoff and jitter, dead letters (this) |
-| 4 | Request signing and SSRF protection |
+| 3 | Queue, worker, retries with backoff and jitter, dead letters |
+| 4 | Request signing and SSRF protection (this) |
 | 5 | Delivery history, manual replay, auto-disable of failing endpoints |
 | 6 | Integration and race tests |
 | 7 | OpenAPI, documentation polish |

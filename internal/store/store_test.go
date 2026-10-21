@@ -362,7 +362,14 @@ func TestConstraintsRejectBadData(t *testing.T) {
 func TestSecretsNeverSerialize(t *testing.T) {
 	ctx, _, q := begin(t)
 	tn := newTenant(t, ctx, q)
-	ep := newEndpoint(t, ctx, q, tn.ID)
+	created := newEndpoint(t, ctx, q, tn.ID)
+	const rotated = "whsec_ROTATEDROTATEDROTATEDROTATED00"
+	ep, err := q.RotateEndpointSecret(ctx, store.RotateEndpointSecretParams{
+		ID: created.ID, TenantID: tn.ID, NewSecret: rotated, GraceMs: 60_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	key, err := q.CreateAPIKey(ctx, store.CreateAPIKeyParams{
 		TenantID: tn.ID, Name: "k", Prefix: "hm_json_000001", KeyHash: bytes.Repeat([]byte{0xCD}, 32),
 	})
@@ -374,8 +381,19 @@ func TestSecretsNeverSerialize(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(epJSON), secret) || strings.Contains(strings.ToLower(string(epJSON)), "secret") {
-		t.Errorf("endpoint JSON exposes the secret: %s", epJSON)
+	// Neither the current nor the previous secret, by value or by field.
+	if strings.Contains(string(epJSON), secret) || strings.Contains(string(epJSON), rotated) {
+		t.Errorf("endpoint JSON exposes a secret value: %s", epJSON)
+	}
+	var fields map[string]any
+	_ = json.Unmarshal(epJSON, &fields)
+	for _, f := range []string{"Secret", "PreviousSecret"} {
+		if _, ok := fields[f]; ok {
+			t.Errorf("endpoint JSON has a %s field: %s", f, epJSON)
+		}
+	}
+	if _, ok := fields["PreviousSecretExpiresAt"]; !ok {
+		t.Errorf("non-secret fields must stay visible: %s", epJSON)
 	}
 
 	keyJSON, err := json.Marshal(key)

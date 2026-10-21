@@ -51,9 +51,13 @@ func run() error {
 			InitialBackoff: wc.BackoffInitial,
 			MaxBackoff:     wc.BackoffMax,
 		},
+		AllowPrivateNetworks: cfg.AllowPrivateDestinations,
 	})
 	if err != nil {
 		return err
+	}
+	if cfg.AllowPrivateDestinations {
+		log.Warn("ALLOW_PRIVATE_DESTINATIONS is on: webhooks may be sent to private and loopback addresses; never use this in production")
 	}
 
 	log.Info("worker started",

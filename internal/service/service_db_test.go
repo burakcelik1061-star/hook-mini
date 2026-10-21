@@ -11,11 +11,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/burakcelik1061-star/hook-mini/internal/database"
+	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
 	"github.com/burakcelik1061-star/hook-mini/internal/store"
 )
 
@@ -203,6 +205,69 @@ func TestEndpointLifecycleAndIsolation(t *testing.T) {
 	}
 	if err := s.DeleteEndpoint(ctx(), a.ID, ep.ID); !errors.Is(err, ErrNotFound) {
 		t.Errorf("second delete: %v, want ErrNotFound", err)
+	}
+}
+
+func TestEndpointURLsPointingInsideAreRejected(t *testing.T) {
+	s := newService(t)
+	tn := newTenant(t, s)
+	ok := newEndpoint(t, s, tn.ID)
+
+	for _, u := range []string{
+		"http://127.0.0.1/hook", "http://127.0.0.1:5432/", "http://localhost:8080/", "http://api.localhost/",
+		"http://[::1]/", "http://10.0.0.8/", "http://192.168.1.10/", "http://169.254.169.254/latest/meta-data/",
+		"http://[::ffff:127.0.0.1]/", "http://0.0.0.0/",
+	} {
+		_, err := s.CreateEndpoint(ctx(), tn.ID, EndpointInput{URL: u})
+		var ve *ValidationError
+		if !errors.As(err, &ve) || ve.Field != "url" || !strings.Contains(ve.Message, "not allowed") {
+			t.Errorf("create %s: err = %v, want a url validation error", u, err)
+		}
+		if _, err := s.UpdateEndpoint(ctx(), tn.ID, ok.ID, EndpointPatch{URL: &u}); !errors.As(err, &ve) {
+			t.Errorf("update to %s: err = %v, want a url validation error", u, err)
+		}
+	}
+
+	// Development setups can opt in.
+	dev := New(testPool, s.log, WithEgressPolicy(safedial.Policy{AllowPrivate: true}))
+	if _, err := dev.CreateEndpoint(ctx(), tn.ID, EndpointInput{URL: "http://127.0.0.1:9000/hook"}); err != nil {
+		t.Errorf("with private destinations allowed: %v", err)
+	}
+}
+
+func TestRotateEndpointSecret(t *testing.T) {
+	s := newService(t)
+	a, b := newTenant(t, s), newTenant(t, s)
+	ep := newEndpoint(t, s, a.ID)
+
+	r1, err := s.RotateEndpointSecret(ctx(), a.ID, ep.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r1.Secret == ep.Secret || !strings.HasPrefix(r1.Secret, "whsec_") {
+		t.Errorf("new secret %q is not a fresh secret", r1.Secret)
+	}
+	if r1.PreviousSecret == nil || *r1.PreviousSecret != ep.Secret {
+		t.Error("the old secret was not kept as the previous one")
+	}
+	if r1.PreviousSecretExpiresAt == nil {
+		t.Fatal("no expiry for the previous secret")
+	}
+	if d := time.Until(*r1.PreviousSecretExpiresAt); d < SecretRotationGrace-time.Minute || d > SecretRotationGrace+time.Minute {
+		t.Errorf("previous secret expires in %s, want about %s", d, SecretRotationGrace)
+	}
+
+	// A second rotation keeps only the immediately previous secret.
+	r2, err := s.RotateEndpointSecret(ctx(), a.ID, ep.ID)
+	if err != nil || *r2.PreviousSecret != r1.Secret || r2.Secret == r1.Secret {
+		t.Errorf("second rotation: previous=%v err=%v", r2.PreviousSecret, err)
+	}
+
+	if _, err := s.RotateEndpointSecret(ctx(), b.ID, ep.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("rotation by another tenant: %v, want ErrNotFound", err)
+	}
+	if got, _ := s.GetEndpoint(ctx(), a.ID, ep.ID); got.Secret != r2.Secret {
+		t.Error("the other tenant's attempt changed the secret")
 	}
 }
 

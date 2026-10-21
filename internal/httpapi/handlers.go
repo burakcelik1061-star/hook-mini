@@ -33,8 +33,11 @@ type endpointResponse struct {
 	DisabledReason      *string    `json:"disabled_reason,omitempty"`
 	CreatedAt           time.Time  `json:"created_at"`
 	UpdatedAt           time.Time  `json:"updated_at"`
-	// Secret is present only in the response to the request that created the
-	// endpoint. It cannot be read again.
+	// PreviousSecretExpiresAt is set while a rotated-out secret still signs
+	// requests. The previous secret itself is never returned.
+	PreviousSecretExpiresAt *time.Time `json:"previous_secret_expires_at,omitempty"`
+	// Secret is present only in the responses to the requests that create
+	// the endpoint or rotate its secret. It cannot be read again.
 	Secret string `json:"secret,omitempty"`
 }
 
@@ -43,6 +46,9 @@ func newEndpointResponse(e store.Endpoint, withSecret bool) endpointResponse {
 		ID: e.ID, URL: e.Url, Description: e.Description, Status: e.Status,
 		ConsecutiveFailures: e.ConsecutiveFailures, DisabledAt: e.DisabledAt, DisabledReason: e.DisabledReason,
 		CreatedAt: e.CreatedAt, UpdatedAt: e.UpdatedAt,
+	}
+	if e.PreviousSecretExpiresAt != nil && e.PreviousSecretExpiresAt.After(time.Now()) {
+		r.PreviousSecretExpiresAt = e.PreviousSecretExpiresAt
 	}
 	if withSecret {
 		r.Secret = e.Secret
@@ -187,6 +193,21 @@ func (h *handlers) updateEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, newEndpointResponse(ep, false))
+}
+
+// rotateSecret replaces an endpoint's signing secret. It takes no body.
+func (h *handlers) rotateSecret(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	ep, err := h.svc.RotateEndpointSecret(r.Context(), principalFrom(r.Context()).TenantID, id)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, newEndpointResponse(ep, true))
 }
 
 func (h *handlers) deleteEndpoint(w http.ResponseWriter, r *http.Request) {

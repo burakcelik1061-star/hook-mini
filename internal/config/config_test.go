@@ -138,6 +138,24 @@ func TestWorkerValidation(t *testing.T) {
 	}
 }
 
+func TestAllowPrivateDestinations(t *testing.T) {
+	base := map[string]string{"DATABASE_URL": "postgres://u:p@db/x"}
+	if cfg, _ := Load(env(base)); cfg.AllowPrivateDestinations {
+		t.Error("private destinations must be refused by default")
+	}
+	for v, want := range map[string]bool{"true": true, "TRUE": true, "1": true, "false": false, "0": false} {
+		e := map[string]string{"DATABASE_URL": "postgres://u:p@db/x", "ALLOW_PRIVATE_DESTINATIONS": v}
+		cfg, err := Load(env(e))
+		if err != nil || cfg.AllowPrivateDestinations != want {
+			t.Errorf("%q: got %v (err=%v), want %v", v, cfg.AllowPrivateDestinations, err, want)
+		}
+	}
+	e := map[string]string{"DATABASE_URL": "postgres://u:p@db/x", "ALLOW_PRIVATE_DESTINATIONS": "yes please"}
+	if _, err := Load(env(e)); err == nil || !strings.Contains(err.Error(), "ALLOW_PRIVATE_DESTINATIONS") {
+		t.Errorf("an unclear value must be rejected, got %v", err)
+	}
+}
+
 func TestLoadRequiresDatabaseURL(t *testing.T) {
 	_, err := Load(env(nil))
 	if err == nil || !strings.Contains(err.Error(), "DATABASE_URL is required") {
