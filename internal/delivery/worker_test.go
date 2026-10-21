@@ -1204,6 +1204,39 @@ func TestPrivateDestinationsAreRefusedAtDialTime(t *testing.T) {
 	f.assertInvariant()
 }
 
+// Regression (found by the chaos test): when the endpoint of an attempt that
+// FAILED had been deleted meanwhile, recording the failure found no endpoint
+// row and the worker logged an internal error. The delivery is gone with the
+// endpoint (cascade), so the result is simply discarded, as for a success.
+func TestEndpointDeletedWhileAFailingAttemptIsInFlight(t *testing.T) {
+	f := newFixture(t)
+	arrived := make(chan struct{}, 1)
+	release := make(chan struct{})
+	srv, _ := newRecorder(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
+		arrived <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	unblock := releaseOnCleanup(t, release)
+	doomed := f.endpoint(srv.URL)
+	f.events(1)
+
+	f.start(testConfig("w-deleted-failing"))
+	<-arrived
+	if err := f.svc.DeleteEndpoint(f.ctx, f.tenant, doomed); err != nil {
+		t.Fatal(err)
+	}
+	unblock()
+
+	f.waitFor(5*time.Second, "the discarded result", func() bool { return strings.Contains(f.logs.String(), "result discarded") })
+	if strings.Contains(f.logs.String(), "recording the attempt failed") {
+		t.Error("a failure for a deleted endpoint was reported as an internal error")
+	}
+	if n := len(f.deliveries()); n != 0 {
+		t.Errorf("%d deliveries survived the deletion of their endpoint", n)
+	}
+}
+
 func TestNewWorkerRejectsBadConfig(t *testing.T) {
 	ok := testConfig("x")
 	for name, mutate := range map[string]func(*Config){

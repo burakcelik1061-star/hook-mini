@@ -4,6 +4,7 @@
 //
 //	POST /anything        answers 200
 //	POST /status/503      answers 503 (any code from 100 to 599)
+//	POST /delay/3000      waits 3000 ms (at most 60000), then answers 200
 //
 // It listens on RECEIVER_ADDR (default :9000). If RECEIVER_SECRETS holds one
 // or more endpoint secrets (separated by spaces or commas), every request's
@@ -71,6 +72,16 @@ func handler(log *slog.Logger, verifier *webhook.Verifier) http.Handler {
 		if code, ok := strings.CutPrefix(r.URL.Path, "/status/"); ok {
 			if n, err := strconv.Atoi(code); err == nil && n >= 100 && n <= 599 {
 				status = n
+			}
+		}
+
+		if ms, ok := strings.CutPrefix(r.URL.Path, "/delay/"); ok {
+			if n, err := strconv.Atoi(ms); err == nil && n > 0 {
+				select {
+				case <-time.After(time.Duration(min(n, 60_000)) * time.Millisecond):
+				case <-r.Context().Done():
+					return
+				}
 			}
 		}
 

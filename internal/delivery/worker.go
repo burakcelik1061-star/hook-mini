@@ -320,6 +320,11 @@ func (w *Worker) record(log *slog.Logger, job store.ClaimDueDeliveriesRow, res r
 		} else {
 			var failures int32
 			failures, err = q.RecordEndpointFailure(ctx, job.EndpointID)
+			if errors.Is(err, pgx.ErrNoRows) {
+				// The endpoint no longer exists: it was deleted while this
+				// attempt was in flight, and its deliveries went with it.
+				return errLeaseLost
+			}
 			if err == nil && w.cfg.AutoDisableAfter > 0 && int(failures) >= w.cfg.AutoDisableAfter {
 				// Too many failures in a row: stop sending to this endpoint
 				// until its owner enables it again. Idempotent: only an

@@ -79,6 +79,9 @@ func (s *Service) IngestEvent(ctx context.Context, tenantID uuid.UUID, in Ingest
 		return s.replay(ctx, q, tenantID, in)
 
 	default:
+		if ve := s.dataError(err, "payload"); ve != nil {
+			return EventResult{}, ve
+		}
 		return EventResult{}, fmt.Errorf("create event: %w", err)
 	}
 }

@@ -341,6 +341,27 @@ pick up the deliveries tests create (their URLs use the reserved
 `winget install BrechtSanders.WinLibs.POSIX.UCRT` and `CGO_ENABLED=1`). CI
 runs it on every push.
 
+### What is tested beyond the unit tests
+
+| Kind | Where | What it proves |
+| --- | --- | --- |
+| **Chaos** | `internal/delivery/chaos_test.go` | 3 workers restarted at random, "crashed" workers that claim and vanish, failing/hanging/slow/rate-limiting endpoints, producers with repeating idempotency keys, an operator replaying, toggling, rotating and deleting, all at once. Afterwards: every delivery is final, attempt history consistent, nothing crossed tenants, every request validly signed, every "succeeded" delivery really arrived. The seed is printed on failure. |
+| **Contention** | `internal/delivery/stress_test.go` | 16 concurrent claimers over 400 deliveries: each handed out exactly once, each with its own lease; 8 concurrent reapers reclaim each expired lease once. |
+| **Fuzzing** | `*/fuzz_test.go` | Validators agree with Postgres (bad input is a `400`, never a `500`); the SSRF policy is consistent across IPv4/IPv6 encodings; signatures round-trip and any tampering is detected; parsers never panic. |
+| **Plan test** | `internal/store/plan_test.go` | The claim query takes its locks exactly once (`EXPLAIN ANALYZE`). |
+| **Mutation checks** | run by hand | Each safety property was removed from the code to confirm a test fails. |
+
+Fuzzing runs as ordinary unit tests over the seed inputs; to fuzz for real
+(the service targets need `TEST_DATABASE_URL`):
+
+```bash
+go test -run '^$' -fuzz '^FuzzIngestEvent$' -fuzztime 60s ./internal/service
+go test -run '^$' -fuzz '^FuzzCheckConsistency$' -fuzztime 60s ./internal/safedial
+```
+
+Inputs that once failed are kept under `testdata/fuzz/` and rerun on every
+`go test`.
+
 ## Changing the schema
 
 ```bash

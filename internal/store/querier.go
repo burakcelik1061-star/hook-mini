@@ -45,6 +45,14 @@ type Querier interface {
 	// the tenant. Safe to repeat: (event_id, endpoint_id) is unique, so a second
 	// call inserts nothing. The composite foreign key rejects an event that does
 	// not belong to the tenant.
+	//
+	// The endpoints are locked FOR KEY SHARE while they are read. Without it an
+	// endpoint deleted between the SELECT and the foreign-key check of the INSERT
+	// failed the whole statement, and with it a perfectly valid event. A
+	// concurrent DELETE needs a conflicting lock, so it either waits for this
+	// transaction (the new deliveries are then removed by its cascade) or has
+	// already finished (the row is no longer returned). Test:
+	// TestIngestDuringEndpointDeletion.
 	CreateDeliveriesForEvent(ctx context.Context, arg CreateDeliveriesForEventParams) ([]Delivery, error)
 	CreateDeliveryAttempt(ctx context.Context, arg CreateDeliveryAttemptParams) (DeliveryAttempt, error)
 	// Every query that takes an endpoint id from outside also takes the tenant id.

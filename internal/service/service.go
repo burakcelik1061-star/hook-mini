@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -84,4 +85,32 @@ func pgViolation(err error, code, constraint string) bool {
 const (
 	pgUniqueViolation     = "23505"
 	pgForeignKeyViolation = "23503"
+	pgCheckViolation      = "23514"
 )
+
+// dataError turns a database rejection of the caller's data into the
+// ValidationError it really is. Validators run first and catch the common
+// cases with clear messages; this is the backstop for everything they cannot
+// know, because the database's idea of valid text and JSON (NUL, lone
+// surrogates, numeric range, locale whitespace) is the one that counts.
+//
+//   - SQLSTATE class 22 (data exception): the value cannot be stored.
+//   - 23514 (check violation): a validator and a CHECK constraint disagree.
+//     The caller still gets a 400, and the drift is logged so it is fixed.
+//
+// It returns nil for any other error, which stays a genuine server failure.
+func (s *Service) dataError(err error, field string) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return nil
+	}
+	switch {
+	case strings.HasPrefix(pgErr.Code, "22"):
+		return invalid(field, "contains a value the database cannot store (for example a \\u0000 escape, an invalid Unicode sequence or a number that is too large)")
+	case pgErr.Code == pgCheckViolation:
+		s.log.Warn("the database rejected input that validation accepted: a validator and a CHECK constraint disagree",
+			"constraint", pgErr.ConstraintName, "field", field)
+		return invalid(field, "is not acceptable")
+	}
+	return nil
+}

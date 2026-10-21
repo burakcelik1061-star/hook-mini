@@ -47,6 +47,9 @@ func (s *Service) CreateEndpoint(ctx context.Context, tenantID uuid.UUID, in End
 		TenantID: tenantID, Url: in.URL, Description: in.Description, Secret: secret,
 	})
 	if err != nil {
+		if ve := s.dataError(err, "body"); ve != nil {
+			return store.Endpoint{}, ve
+		}
 		return store.Endpoint{}, fmt.Errorf("create endpoint: %w", err)
 	}
 	return ep, nil
@@ -146,6 +149,9 @@ func (s *Service) UpdateEndpoint(ctx context.Context, tenantID, id uuid.UUID, p 
 		return store.Endpoint{}, ErrNotFound
 	}
 	if err != nil {
+		if ve := s.dataError(err, "body"); ve != nil {
+			return store.Endpoint{}, ve
+		}
 		return store.Endpoint{}, fmt.Errorf("update endpoint: %w", err)
 	}
 	return ep, nil

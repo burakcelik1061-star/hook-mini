@@ -100,12 +100,20 @@ func parseRetryAfter(h string, now time.Time) time.Duration {
 			return 0
 		}
 		// Clamp absurd values before converting, so they cannot overflow.
-		return time.Duration(min(secs, int64(366*24*time.Hour/time.Second))) * time.Second
+		return time.Duration(min(secs, int64(maxRetryAfter/time.Second))) * time.Second
 	}
 	if t, err := http.ParseTime(h); err == nil {
+		// Sub saturates at about 292 years for dates far in the future (a
+		// fuzz test found "Retry-After: ... 7000 GMT"), so the date form is
+		// clamped to the same ceiling as the seconds form.
 		if d := t.Sub(now); d > 0 {
-			return d
+			return min(d, maxRetryAfter)
 		}
 	}
 	return 0
 }
+
+// maxRetryAfter is the longest Retry-After value ever returned, whichever form
+// the header used. It only guards arithmetic; MaxBackoff is what actually
+// bounds how long a delivery waits.
+const maxRetryAfter = 366 * 24 * time.Hour

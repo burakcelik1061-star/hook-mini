@@ -100,6 +100,8 @@ func TestParseRetryAfter(t *testing.T) {
 		"soon":           0,
 		"1.5":            0,
 		"99999999999999": 366 * 24 * time.Hour, // clamped, no overflow
+		// A far-future date used to come back as ~292 years (found by fuzzing).
+		"Wed, 01 Oct 7000 00:00:00 GMT":                   366 * 24 * time.Hour,
 		now.Add(90 * time.Second).Format(http.TimeFormat): 90 * time.Second,
 		now.Add(-time.Hour).Format(http.TimeFormat):       0, // in the past
 	}

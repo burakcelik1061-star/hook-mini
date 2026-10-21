@@ -35,6 +35,7 @@ INSERT INTO deliveries (tenant_id, event_id, endpoint_id)
 SELECT e.tenant_id, $1, e.id
 FROM endpoints e
 WHERE e.tenant_id = $2 AND e.status = 'active'
+FOR KEY SHARE OF e
 ON CONFLICT (event_id, endpoint_id) DO NOTHING
 RETURNING id, tenant_id, event_id, endpoint_id, status, attempt_count, next_attempt_at, locked_until, locked_by, last_status_code, last_error, completed_at, created_at, updated_at, lease_token, round_base
 `
@@ -51,6 +52,14 @@ type CreateDeliveriesForEventParams struct {
 // the tenant. Safe to repeat: (event_id, endpoint_id) is unique, so a second
 // call inserts nothing. The composite foreign key rejects an event that does
 // not belong to the tenant.
+//
+// The endpoints are locked FOR KEY SHARE while they are read. Without it an
+// endpoint deleted between the SELECT and the foreign-key check of the INSERT
+// failed the whole statement, and with it a perfectly valid event. A
+// concurrent DELETE needs a conflicting lock, so it either waits for this
+// transaction (the new deliveries are then removed by its cascade) or has
+// already finished (the row is no longer returned). Test:
+// TestIngestDuringEndpointDeletion.
 func (q *Queries) CreateDeliveriesForEvent(ctx context.Context, arg CreateDeliveriesForEventParams) ([]Delivery, error) {
 	rows, err := q.db.Query(ctx, createDeliveriesForEvent, arg.EventID, arg.TenantID)
 	if err != nil {

@@ -52,7 +52,7 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func newService(t *testing.T) *Service {
+func newService(t testing.TB) *Service {
 	t.Helper()
 	if testPool == nil {
 		t.Skip("TEST_DATABASE_URL not set")
@@ -366,6 +366,62 @@ func TestIngestFansOutToActiveEndpointsOfTheTenantOnly(t *testing.T) {
 	}
 	if _, err := s.GetEvent(ctx(), b.ID, res.Event.ID); !errors.Is(err, ErrNotFound) {
 		t.Errorf("another tenant reads the event: %v", err)
+	}
+}
+
+// Regression (found by the chaos test): fan-out reads the tenant's endpoints,
+// then inserts deliveries that reference them. An endpoint deleted in between
+// made the insert fail its foreign key, so a perfectly valid event was
+// answered with a 500. The event must instead wait for the deletion and fan
+// out to the endpoints that remain.
+func TestIngestDuringEndpointDeletion(t *testing.T) {
+	s := newService(t)
+	tn := newTenant(t, s)
+	doomed, kept := newEndpoint(t, s, tn.ID), newEndpoint(t, s, tn.ID)
+
+	// An operator's transaction deletes the endpoint and has not committed yet.
+	tx, err := testPool.Begin(ctx())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx())
+	if _, err := tx.Exec(ctx(), `DELETE FROM endpoints WHERE id = $1`, doomed.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	type outcome struct {
+		res EventResult
+		err error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := s.IngestEvent(ctx(), tn.ID, IngestInput{Type: "a.b", Payload: json.RawMessage(`{}`)})
+		done <- outcome{res, err}
+	}()
+
+	select {
+	case o := <-done:
+		t.Fatalf("ingestion finished (%+v) while the deletion was still uncommitted: it must wait for it", o)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := tx.Commit(ctx()); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case o := <-done:
+		if o.err != nil {
+			t.Fatalf("a valid event failed because an endpoint was deleted at the same moment: %v", o.err)
+		}
+		if o.res.DeliveryCount != 1 {
+			t.Errorf("fanned out to %d endpoints, want only the remaining one", o.res.DeliveryCount)
+		}
+		var got uuid.UUID
+		if err := testPool.QueryRow(ctx(), `SELECT endpoint_id FROM deliveries WHERE event_id = $1`, o.res.Event.ID).Scan(&got); err != nil || got != kept.ID {
+			t.Errorf("the delivery targets %v (err=%v), want the remaining endpoint %v", got, err, kept.ID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ingestion did not finish after the deletion committed")
 	}
 }
 
