@@ -3,13 +3,14 @@ package httpapi
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+
+	"github.com/burakcelik1061-star/hook-mini/internal/service"
 )
 
 // Pinger is the one thing the HTTP layer needs from the database: proof that
@@ -23,21 +24,59 @@ type Pinger interface {
 type Deps struct {
 	Log *slog.Logger
 	DB  Pinger
+	// Svc backs the /v1 API. When nil only the operational endpoints are
+	// served, which keeps the health handlers testable without a database.
+	Svc *service.Service
 }
 
-// NewRouter returns the root handler. Phase 0 exposes only the operational
-// endpoints; the public API is mounted here in later phases.
+// NewRouter returns the root handler.
 func NewRouter(d Deps) http.Handler {
 	r := chi.NewRouter()
 
 	r.Use(middleware.RequestID)
+	r.Use(requestIDHeader)
 	r.Use(requestLogger(d.Log))
 	r.Use(middleware.Recoverer)
+
+	r.NotFound(func(w http.ResponseWriter, req *http.Request) {
+		writeError(w, req, d.Log, &apiError{Status: http.StatusNotFound, Code: "not_found", Message: "no such route"})
+	})
+	r.MethodNotAllowed(func(w http.ResponseWriter, req *http.Request) {
+		writeError(w, req, d.Log, &apiError{Status: http.StatusMethodNotAllowed, Code: "method_not_allowed", Message: "method not allowed for this route"})
+	})
 
 	r.Get("/healthz", healthz)
 	r.Get("/readyz", readyz(d.Log, d.DB))
 
+	if d.Svc != nil {
+		h := &handlers{svc: d.Svc, log: d.Log}
+		r.Route("/v1", func(r chi.Router) {
+			r.Use(apiHeaders, h.authenticate)
+
+			r.Route("/endpoints", func(r chi.Router) {
+				r.Post("/", h.createEndpoint)
+				r.Get("/", h.listEndpoints)
+				r.Get("/{id}", h.getEndpoint)
+				r.Patch("/{id}", h.updateEndpoint)
+				r.Delete("/{id}", h.deleteEndpoint)
+			})
+			r.Route("/events", func(r chi.Router) {
+				r.Post("/", h.createEvent)
+				r.Get("/", h.listEvents)
+				r.Get("/{id}", h.getEvent)
+			})
+		})
+	}
+
 	return r
+}
+
+// requestIDHeader echoes the request ID so a client can quote it in a report.
+func requestIDHeader(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Request-Id", middleware.GetReqID(r.Context()))
+		next.ServeHTTP(w, r)
+	})
 }
 
 // healthz is the liveness probe: the process is up and serving. It must not
@@ -66,12 +105,6 @@ func readyz(log *slog.Logger, db Pinger) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	}
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
 }
 
 // requestLogger emits one structured line per request, carrying the request

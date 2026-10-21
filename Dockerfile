@@ -8,7 +8,8 @@ COPY . .
 ENV CGO_ENABLED=0
 RUN go build -trimpath -ldflags="-s -w" -o /out/api ./cmd/api \
  && go build -trimpath -ldflags="-s -w" -o /out/worker ./cmd/worker \
- && go build -trimpath -ldflags="-s -w" -o /out/migrate ./cmd/migrate
+ && go build -trimpath -ldflags="-s -w" -o /out/migrate ./cmd/migrate \
+ && go build -trimpath -ldflags="-s -w" -o /out/admin ./cmd/admin
 
 # One small runtime image holds all three binaries; compose picks which to run.
 FROM alpine:3.22
