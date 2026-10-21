@@ -151,7 +151,9 @@ func TestChaos(t *testing.T) {
 		c.PollInterval = 5 * time.Millisecond
 		c.LeaseDuration, c.RequestTimeout = 800*time.Millisecond, 150*time.Millisecond
 		c.ReapInterval = 100 * time.Millisecond
-		c.DrainTimeout = 200 * time.Millisecond
+		// Shorter than most requests to the slow endpoint (0-60ms), so a
+		// restart interrupts attempts in flight instead of waiting for them.
+		c.DrainTimeout = 20 * time.Millisecond
 		c.Retry = RetryPolicy{MaxAttempts: 4, InitialBackoff: 5 * time.Millisecond, MaxBackoff: 40 * time.Millisecond}
 		c.AutoDisableAfter = 30
 		return c
@@ -291,6 +293,7 @@ func TestChaos(t *testing.T) {
 		opReplays, opToggles atomic.Int64
 		rotations            atomic.Int64
 		deleted              atomic.Bool
+		replayedIDs          sync.Map // delivery id -> true
 	)
 	{
 		r := rng(40)
@@ -307,6 +310,7 @@ func TestChaos(t *testing.T) {
 				var ce *service.ConflictError
 				if err == nil {
 					opReplays.Add(1)
+					replayedIDs.Store(id, true)
 				} else if !errors.As(err, &ce) && !errors.Is(err, service.ErrNotFound) {
 					t.Errorf("ReplayDelivery: %v", err)
 				}
@@ -378,17 +382,19 @@ func TestChaos(t *testing.T) {
 	}
 
 	// ---- what the run looked like (a test that did nothing proves nothing) ----
-	var total, succeeded, dead, lost, retried int
+	var total, succeeded, dead, lost, retried, interrupted int
 	if err := testPool.QueryRow(f.ctx, `SELECT count(*), count(*) FILTER (WHERE status = 'succeeded'), count(*) FILTER (WHERE status = 'dead') FROM deliveries`).Scan(&total, &succeeded, &dead); err != nil {
 		t.Fatal(err)
 	}
 	_ = testPool.QueryRow(f.ctx, `SELECT count(*) FROM delivery_attempts WHERE error LIKE 'lease expired%'`).Scan(&lost)
 	_ = testPool.QueryRow(f.ctx, `SELECT count(*) FROM deliveries WHERE attempt_count > 1 AND status = 'succeeded'`).Scan(&retried)
-	t.Logf("chaos: %d deliveries (%d succeeded, %d dead), %d events replayed by idempotency, %d crashed claims, %d lost leases reclaimed, %d succeeded after retries, %d worker restarts, %d operator replays, %d toggles, %d rotations, endpoint deleted: %v, %d requests received",
-		total, succeeded, dead, replayed.Load(), ghosts.Load(), lost, retried, restarts.Load(), opReplays.Load(), opToggles.Load(), rotations.Load(), deleted.Load(), len(hits))
+	_ = testPool.QueryRow(f.ctx, `SELECT count(*) FROM delivery_attempts WHERE error LIKE 'canceled:%'`).Scan(&interrupted)
+	t.Logf("chaos: %d deliveries (%d succeeded, %d dead), %d events replayed by idempotency, %d crashed claims, %d lost leases reclaimed, %d attempts interrupted by restarts, %d succeeded after retries, %d worker restarts, %d operator replays, %d toggles, %d rotations, endpoint deleted: %v, %d requests received",
+		total, succeeded, dead, replayed.Load(), ghosts.Load(), lost, interrupted, retried, restarts.Load(), opReplays.Load(), opToggles.Load(), rotations.Load(), deleted.Load(), len(hits))
 	for name, n := range map[string]int64{
 		"deliveries": int64(total), "succeeded": int64(succeeded), "dead": int64(dead), "crashed claims": ghosts.Load(),
 		"lost leases": int64(lost), "retries": int64(retried), "restarts": restarts.Load(), "idempotent replays": replayed.Load(),
+		"interrupted attempts": int64(interrupted),
 	} {
 		if n == 0 {
 			t.Errorf("the chaos run produced no %s: the test did not exercise what it claims to", name)
@@ -430,6 +436,46 @@ func TestChaos(t *testing.T) {
 		OR (status = 'dead' AND (last_error IS NULL OR completed_at IS NULL))`).Scan(&incoherent)
 	if incoherent != 0 {
 		t.Errorf("%d deliveries have a final state that does not match their last result", incoherent)
+	}
+
+	// 3b. The retry budget. No delivery used more attempts in its current
+	// round than allowed. And an attempt the worker interrupted itself is not
+	// counted: it moves round_base along by one, so in a delivery that was
+	// never replayed (a replay resets round_base) round_base is exactly the
+	// number of interrupted attempts.
+	var overBudget int
+	_ = testPool.QueryRow(f.ctx, `SELECT count(*) FROM deliveries WHERE attempt_count - round_base > $1`, cfg("x").Retry.MaxAttempts).Scan(&overBudget)
+	if overBudget != 0 {
+		t.Errorf("%d deliveries exceeded their retry budget", overBudget)
+	}
+	brows, err := testPool.Query(f.ctx, `
+		SELECT d.id, d.round_base, count(a.id) FILTER (WHERE a.error LIKE 'canceled:%')
+		FROM deliveries d LEFT JOIN delivery_attempts a ON a.delivery_id = d.id
+		GROUP BY d.id, d.round_base`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var miscounted []uuid.UUID
+	for brows.Next() {
+		var id uuid.UUID
+		var base, interruptions int
+		_ = brows.Scan(&id, &base, &interruptions)
+		if _, wasReplayed := replayedIDs.Load(id); !wasReplayed && base != interruptions {
+			miscounted = append(miscounted, id)
+		}
+	}
+	brows.Close()
+	for _, id := range miscounted[:min(len(miscounted), 3)] {
+		t.Errorf("delivery %s: round_base does not match its interrupted attempts; history:", id)
+		hrows, _ := testPool.Query(f.ctx, `SELECT d.round_base, d.attempt_count, a.attempt_no, coalesce(a.error, '')
+			FROM deliveries d JOIN delivery_attempts a ON a.delivery_id = d.id WHERE d.id = $1 ORDER BY a.attempt_no`, id)
+		for hrows.Next() {
+			var base, count, no int
+			var errText string
+			_ = hrows.Scan(&base, &count, &no, &errText)
+			t.Logf("  round_base=%d attempt_count=%d | #%d %q", base, count, no, errText)
+		}
+		hrows.Close()
 	}
 
 	// 4. Events: idempotency produced exactly the events we created.

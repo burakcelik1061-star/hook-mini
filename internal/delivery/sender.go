@@ -82,7 +82,14 @@ type result struct {
 	statusCode int    // 0 when no HTTP response arrived
 	snippet    string // start of the response body, safe to store
 	errText    string // empty only for a 2xx response
+	// detail is the transport error in full, addresses included. It is for
+	// the operator's log only; errText is what the tenant gets to see.
+	detail     string
 	retryAfter time.Duration
+	// interrupted is set when the caller cancelled the attempt before a
+	// response arrived (the worker stopping), as opposed to the endpoint
+	// failing or timing out. Such an attempt says nothing about the endpoint.
+	interrupted bool
 }
 
 func (r result) ok() bool { return r.errText == "" }
@@ -116,8 +123,8 @@ func newSender(transport http.RoundTripper, timeout time.Duration) *sender {
 
 // send makes one attempt. The whole exchange, reading the response included,
 // is bounded by the sender's timeout.
-func (s *sender) send(ctx context.Context, m message) result {
-	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+func (s *sender) send(parent context.Context, m message) result {
+	ctx, cancel := context.WithTimeout(parent, s.timeout)
 	defer cancel()
 
 	res := result{started: s.now()}
@@ -142,6 +149,8 @@ func (s *sender) send(ctx context.Context, m message) result {
 	resp, err := s.client.Do(req)
 	if err != nil {
 		res.errText = describe(err, s.timeout)
+		res.detail = err.Error()
+		res.interrupted = parent.Err() != nil
 		res.duration = s.now().Sub(res.started)
 		return res
 	}
@@ -165,18 +174,37 @@ func (s *sender) send(ctx context.Context, m message) result {
 }
 
 // describe turns a transport error into a short message for the delivery
-// history. The endpoint URL is not repeated (it is already on the endpoint).
+// history, which the tenant reads. The endpoint URL is not repeated (it is
+// already on the endpoint), and neither is any address: Go's network errors
+// name the resolved IP, the worker's own address and the DNS server, which
+// would let a tenant map the internal network by registering internal names.
 func describe(err error, timeout time.Duration) string {
 	var ue *url.Error
 	if errors.As(err, &ue) {
 		err = ue.Err
 	}
-	var ne net.Error
+	var (
+		ne      net.Error
+		blocked *safedial.BlockedError
+		dnsErr  *net.DNSError
+		opErr   *net.OpError
+	)
 	switch {
 	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
 		return fmt.Sprintf("timeout: no complete response within %s", timeout)
 	case errors.Is(err, context.Canceled):
 		return "canceled: the worker stopped before the endpoint responded"
+	case errors.As(err, &blocked):
+		return "blocked: the endpoint's host resolves to an address that is not allowed (" + blocked.Reason + ")"
+	case errors.As(err, &dnsErr):
+		if dnsErr.IsNotFound {
+			return "dns: no such host"
+		}
+		return "dns: the host name could not be resolved"
+	case errors.As(err, &opErr) && opErr.Err != nil:
+		// The operation and the system's reason ("dial: connect: connection
+		// refused"), without the addresses OpError.Error would add.
+		return clean(opErr.Op+": "+opErr.Err.Error(), maxErrorRunes)
 	}
 	return clean(err.Error(), maxErrorRunes)
 }

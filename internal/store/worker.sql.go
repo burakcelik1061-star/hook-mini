@@ -291,6 +291,39 @@ func (q *Queries) RecordLostAttempts(ctx context.Context, arg RecordLostAttempts
 	return err
 }
 
+const returnInterruptedDelivery = `-- name: ReturnInterruptedDelivery :execrows
+UPDATE deliveries
+SET status           = 'pending',
+    attempt_count    = attempt_count + 1,
+    round_base       = round_base + 1,
+    next_attempt_at  = now(),
+    locked_until     = NULL,
+    locked_by        = NULL,
+    lease_token      = NULL,
+    last_status_code = NULL,
+    last_error       = $1::text
+WHERE id = $2 AND lease_token = $3::uuid AND status = 'in_flight'
+`
+
+type ReturnInterruptedDeliveryParams struct {
+	LastError  string
+	ID         uuid.UUID
+	LeaseToken uuid.UUID
+}
+
+// Hands back a delivery whose attempt the worker itself cut short while
+// shutting down. The attempt is recorded (the request may have reached the
+// endpoint) but is not held against the delivery: round_base moves along
+// with attempt_count, so the retry budget is unchanged, and it is due again
+// at once.
+func (q *Queries) ReturnInterruptedDelivery(ctx context.Context, arg ReturnInterruptedDeliveryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, returnInterruptedDelivery, arg.LastError, arg.ID, arg.LeaseToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const scheduleDeliveryRetry = `-- name: ScheduleDeliveryRetry :execrows
 UPDATE deliveries
 SET status           = 'pending',

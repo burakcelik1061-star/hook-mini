@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/burakcelik1061-star/hook-mini/pkg/webhook"
 )
@@ -96,9 +97,13 @@ func handler(log *slog.Logger, verifier *webhook.Verifier) http.Handler {
 	})
 }
 
+// truncate cuts s to at most n bytes without splitting a UTF-8 character.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "..."
 }

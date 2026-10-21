@@ -6,8 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/go-chi/chi/v5/middleware"
-
 	"github.com/burakcelik1061-star/hook-mini/internal/service"
 )
 
@@ -63,15 +61,24 @@ func writeError(w http.ResponseWriter, r *http.Request, log *slog.Logger, err er
 		}
 	default:
 		log.ErrorContext(r.Context(), "unhandled error",
-			slog.String("request_id", middleware.GetReqID(r.Context())),
+			slog.String("request_id", requestIDOf(r)),
 			slog.String("method", r.Method), slog.String("path", r.URL.Path),
 			slog.Any("error", err))
-		apiErr = &apiError{Status: http.StatusInternalServerError, Code: "internal_error", Message: "an unexpected error occurred"}
+		apiErr = internalError()
 	}
+	writeAPIError(w, r, apiErr)
+}
 
+// internalError is what a client sees of any failure that is not its own.
+func internalError() *apiError {
+	return &apiError{Status: http.StatusInternalServerError, Code: "internal_error", Message: "an unexpected error occurred"}
+}
+
+// writeAPIError writes the error envelope, request ID included.
+func writeAPIError(w http.ResponseWriter, r *http.Request, apiErr *apiError) {
 	type body struct {
 		*apiError
 		RequestID string `json:"request_id,omitempty"`
 	}
-	writeJSON(w, apiErr.Status, map[string]any{"error": body{apiError: apiErr, RequestID: middleware.GetReqID(r.Context())}})
+	writeJSON(w, apiErr.Status, map[string]any{"error": body{apiError: apiErr, RequestID: requestIDOf(r)}})
 }

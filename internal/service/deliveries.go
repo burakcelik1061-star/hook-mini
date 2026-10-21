@@ -98,6 +98,11 @@ func (s *Service) ReplayDelivery(ctx context.Context, tenantID, id uuid.UUID) (s
 		return store.Delivery{}, fmt.Errorf("get delivery: %w", err)
 	}
 	ep, err := s.q.GetEndpoint(ctx, store.GetEndpointParams{ID: cur.EndpointID, TenantID: tenantID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The endpoint was deleted since the delivery was read, and the
+		// delivery went with it (ON DELETE CASCADE).
+		return store.Delivery{}, ErrNotFound
+	}
 	if err != nil {
 		return store.Delivery{}, fmt.Errorf("get endpoint: %w", err)
 	}
@@ -113,6 +118,10 @@ func (s *Service) ReplayDelivery(ctx context.Context, tenantID, id uuid.UUID) (s
 	// finds the row dead or succeeded.
 	d, err := s.q.ReplayDelivery(ctx, store.ReplayDeliveryParams{ID: id, TenantID: tenantID})
 	if errors.Is(err, pgx.ErrNoRows) {
+		// Refused by the status guard, unless the delivery is gone by now.
+		if _, err := s.q.GetDelivery(ctx, store.GetDeliveryParams{ID: id, TenantID: tenantID}); errors.Is(err, pgx.ErrNoRows) {
+			return store.Delivery{}, ErrNotFound
+		}
 		return store.Delivery{}, &ConflictError{
 			Code:    ConflictNotReplayable,
 			Message: "only a succeeded or dead delivery can be replayed; this one is still being delivered",

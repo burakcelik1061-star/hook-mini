@@ -7,15 +7,21 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/burakcelik1061-star/hook-mini/api"
+	"github.com/burakcelik1061-star/hook-mini/internal/openapicheck"
 	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
 	"github.com/burakcelik1061-star/hook-mini/pkg/webhook"
 )
@@ -123,6 +129,15 @@ func TestRequestsAreSignedPerStandardWebhooks(t *testing.T) {
 		t.Errorf("webhook-signature = %q, want one v1 signature", sig)
 	}
 
+	// What we send is what api/openapi.yaml documents for the webhook.
+	spec, err := openapicheck.Load(api.OpenAPI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := spec.ValidateWebhook("event.delivery", h, body); err != nil {
+		t.Errorf("the request does not match the webhook in api/openapi.yaml: %v", err)
+	}
+
 	// The receiver side of the standard accepts it...
 	v, _ := webhook.NewVerifier(testSecret)
 	if err := v.Verify(h, body); err != nil {
@@ -196,13 +211,64 @@ func TestDefaultSenderRefusesLoopback(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached.Store(true) }))
 	defer srv.Close()
 
-	m, _ := testMessage(t, srv.URL)
+	// By name, so the address comes from DNS, as with a tenant's internal host.
+	m, _ := testMessage(t, strings.Replace(srv.URL, "127.0.0.1", "localhost", 1))
 	res := newSender(nil, time.Second).send(context.Background(), m)
-	if res.ok() || !strings.Contains(res.errText, "not allowed: loopback") {
+	if res.ok() || !strings.Contains(res.errText, "not allowed (loopback address)") {
 		t.Errorf("unexpected result: %+v", res)
+	}
+	if strings.Contains(res.errText, "127.0.0.1") || strings.Contains(res.errText, "::1") {
+		t.Errorf("the error names the resolved address: %q", res.errText)
+	}
+	// The operator's log still gets the full story.
+	if !strings.Contains(res.detail, "127.0.0.1") && !strings.Contains(res.detail, "::1") {
+		t.Errorf("detail %q does not name the refused address", res.detail)
 	}
 	if reached.Load() {
 		t.Error("the default sender reached a loopback server")
+	}
+}
+
+// The delivery history is shown to the tenant, so it must not reveal what
+// the worker's network looks like: resolved addresses, its own address, the
+// DNS server. Go's error strings contain all of these.
+func TestDescribeNamesNoAddresses(t *testing.T) {
+	src := &net.TCPAddr{IP: net.ParseIP("172.18.0.5"), Port: 43210}
+	dst := &net.TCPAddr{IP: net.ParseIP("10.1.2.3"), Port: 80}
+	wrap := func(err error) error { return &url.Error{Op: "Post", URL: "http://db.internal.example/", Err: err} }
+	tests := map[string]struct {
+		err  error
+		want string
+	}{
+		"blocked destination": {
+			wrap(&net.OpError{Op: "dial", Net: "tcp", Addr: dst, Err: &safedial.BlockedError{Addr: netip.MustParseAddr("10.1.2.3"), Reason: "private network"}}),
+			"not allowed (private network)",
+		},
+		"unknown host": {
+			wrap(&net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host", Name: "db.internal.example", Server: "10.0.0.2:53", IsNotFound: true}}),
+			"dns: no such host",
+		},
+		"resolver failure": {
+			wrap(&net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "server misbehaving", Name: "db.internal.example", Server: "10.0.0.2:53"}}),
+			"dns: the host name could not be resolved",
+		},
+		"connection reset": {
+			wrap(&net.OpError{Op: "read", Net: "tcp", Source: src, Addr: dst, Err: &os.SyscallError{Syscall: "read", Err: syscall.ECONNRESET}}),
+			"read: read: ",
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			got := describe(tt.err, time.Second)
+			if !strings.Contains(got, tt.want) {
+				t.Errorf("describe = %q, want it to contain %q", got, tt.want)
+			}
+			for _, secret := range []string{"10.1.2.3", "172.18.0.5", "10.0.0.2", "43210", "db.internal.example"} {
+				if strings.Contains(got, secret) {
+					t.Errorf("describe = %q, which reveals %s", got, secret)
+				}
+			}
+		})
 	}
 }
 
@@ -318,6 +384,9 @@ func TestSendConnectionRefused(t *testing.T) {
 	}
 	if strings.Contains(res.errText, "Post ") {
 		t.Errorf("error repeats the request line: %q", res.errText)
+	}
+	if strings.Contains(res.errText, "127.0.0.1") {
+		t.Errorf("error names an address: %q", res.errText)
 	}
 }
 

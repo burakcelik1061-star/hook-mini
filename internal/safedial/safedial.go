@@ -55,13 +55,27 @@ var blockedPrefixes = []struct {
 	{netip.MustParsePrefix("198.51.100.0/24"), "documentation"},
 	{netip.MustParsePrefix("203.0.113.0/24"), "documentation"},
 	{netip.MustParsePrefix("240.0.0.0/4"), "reserved"},
+	// A public address, but on Azure it is the platform's WireServer, which
+	// answers only from inside a VM (host agent configuration, health probes).
+	// The metadata services of other clouds sit in ranges blocked above
+	// (169.254.169.254, 100.100.100.200, fd00:ec2::254).
+	{netip.MustParsePrefix("168.63.129.16/32"), "cloud platform service (Azure WireServer)"},
 	{netip.MustParsePrefix("64:ff9b::/96"), "NAT64 (embeds an IPv4 address)"},
 	{netip.MustParsePrefix("64:ff9b:1::/48"), "local NAT64 (embeds an IPv4 address)"},
 	{netip.MustParsePrefix("100::/64"), "discard-only"},
 	{netip.MustParsePrefix("2001::/32"), "Teredo (embeds an IPv4 address)"},
+	{netip.MustParsePrefix("2001::/23"), "IETF protocol assignments"},
 	{netip.MustParsePrefix("2001:db8::/32"), "documentation"},
 	{netip.MustParsePrefix("2002::/16"), "6to4 (embeds an IPv4 address)"},
+	{netip.MustParsePrefix("3fff::/20"), "documentation"},
 }
+
+// globalUnicast6 is the only IPv6 range assigned for global unicast. IPv6 is
+// judged by this allowlist rather than by a list of exceptions: the
+// remaining space holds deprecated and special forms (IPv4-compatible
+// ::a.b.c.d, SIIT ::ffff:0:a.b.c.d, site-local fec0::/10) that some networks
+// still route inside, and that netip.Addr.IsGlobalUnicast accepts.
+var globalUnicast6 = netip.MustParsePrefix("2000::/3")
 
 // Check reports whether addr may be contacted.
 func (p Policy) Check(addr netip.Addr) error {
@@ -93,6 +107,9 @@ func (p Policy) Check(addr netip.Addr) error {
 			return &BlockedError{Addr: addr, Reason: b.reason}
 		}
 	}
+	if addr.Is6() && !globalUnicast6.Contains(addr) {
+		return &BlockedError{Addr: addr, Reason: "outside the IPv6 global unicast range (2000::/3)"}
+	}
 	if !addr.IsGlobalUnicast() {
 		return &BlockedError{Addr: addr, Reason: "not a public unicast address"}
 	}
@@ -108,6 +125,9 @@ func (p Policy) control(_, address string, _ syscall.RawConn) error {
 	}
 	return p.Check(ap.Addr())
 }
+
+// maxResponseHeaderBytes bounds the response headers a Transport accepts.
+const maxResponseHeaderBytes = 64 << 10
 
 // Dialer returns a dialer that refuses addresses the policy blocks.
 func (p Policy) Dialer() *net.Dialer {
@@ -126,6 +146,9 @@ func (p Policy) Transport() *http.Transport {
 	t.Proxy = nil
 	t.DialContext = p.Dialer().DialContext
 	t.MaxIdleConnsPerHost = 16
+	// Only the status line and Retry-After are of any use; the 1 MB default
+	// would let each endpoint make every attempt allocate a megabyte.
+	t.MaxResponseHeaderBytes = maxResponseHeaderBytes
 	return t
 }
 

@@ -23,7 +23,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/burakcelik1061-star/hook-mini/api"
 	"github.com/burakcelik1061-star/hook-mini/internal/database"
+	"github.com/burakcelik1061-star/hook-mini/internal/openapicheck"
 	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
 	"github.com/burakcelik1061-star/hook-mini/internal/service"
 	"github.com/burakcelik1061-star/hook-mini/internal/store"
@@ -870,20 +872,26 @@ func TestShutdownLetsTheAttemptInFlightFinish(t *testing.T) {
 func TestShutdownCancelsAttemptsAfterTheDrainTimeout(t *testing.T) {
 	f := newFixture(t)
 	arrived := make(chan struct{}, 1)
-	srv, _ := newRecorder(t, func(_ http.ResponseWriter, r *http.Request, _ int) {
+	srv, rec := newRecorder(t, func(_ http.ResponseWriter, r *http.Request, n int) {
+		if n > 1 {
+			return // 200 from the second request on
+		}
 		arrived <- struct{}{}
 		select {
 		case <-r.Context().Done():
 		case <-time.After(10 * time.Second):
 		}
 	})
-	f.endpoint(srv.URL)
+	ep := f.endpoint(srv.URL)
 	f.events(1)
 
 	cfg := testConfig("w-abort")
 	cfg.RequestTimeout = 5 * time.Second
 	cfg.LeaseDuration = 10 * time.Second
 	cfg.DrainTimeout = 200 * time.Millisecond
+	// One attempt per round: if the interrupted attempt counted, the delivery
+	// would be dead now.
+	cfg.Retry.MaxAttempts = 1
 	stop := f.start(cfg)
 	<-arrived
 
@@ -892,11 +900,30 @@ func TestShutdownCancelsAttemptsAfterTheDrainTimeout(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Errorf("stopping took %s despite a 200ms drain timeout", elapsed)
 	}
-	// The cancelled attempt is recorded as a failure and will be retried.
+	// The cancelled attempt is in the history, but it is not held against the
+	// delivery or the endpoint: the worker interrupted it, not the endpoint.
 	d := f.only()
 	a := f.attempts(d.ID)
-	if d.Status != "pending" || len(a) != 1 || a[0].Error == nil || !strings.Contains(*a[0].Error, "canceled") {
-		t.Errorf("unexpected state after an aborted attempt: %+v attempts=%+v", d, a)
+	if d.Status != "pending" || d.AttemptCount != 1 || d.RoundBase != 1 ||
+		len(a) != 1 || a[0].Error == nil || !strings.Contains(*a[0].Error, "canceled") {
+		t.Errorf("unexpected state after an interrupted attempt: %+v attempts=%+v", d, a)
+	}
+	if d.NextAttemptAt.After(time.Now().Add(time.Second)) {
+		t.Errorf("an interrupted delivery should be due again at once, next_attempt_at=%s", d.NextAttemptAt)
+	}
+	var failures int32
+	if err := testPool.QueryRow(f.ctx, `SELECT consecutive_failures FROM endpoints WHERE id = $1`, ep).Scan(&failures); err != nil {
+		t.Fatal(err)
+	}
+	if failures != 0 {
+		t.Errorf("consecutive_failures = %d: an interrupted attempt must not count against the endpoint", failures)
+	}
+
+	// The next worker delivers it within the same, unused, budget.
+	f.start(testConfig("w-after-abort"))
+	f.waitStatus(5*time.Second, "succeeded", 1)
+	if d := f.only(); d.AttemptCount != 2 || rec.count() != 2 {
+		t.Errorf("attempt_count=%d requests=%d, want 2 and 2", d.AttemptCount, rec.count())
 	}
 	f.assertInvariant()
 }
@@ -1123,10 +1150,18 @@ func TestDeliveredRequestsVerifyWithTheEndpointSecret(t *testing.T) {
 	f.start(testConfig("w-signed"))
 	f.waitStatus(5*time.Second, "succeeded", 3)
 
+	spec, err := openapicheck.Load(api.OpenAPI)
+	if err != nil {
+		t.Fatal(err)
+	}
 	v := verifier(t, secret)
 	for i, h := range rec.all() {
 		if err := v.Verify(h.header, h.body); err != nil {
 			t.Errorf("request %d does not verify with the endpoint's secret: %v", i, err)
+		}
+		// Also what a real worker sent, not just the sender in isolation.
+		if err := spec.ValidateWebhook("event.delivery", h.header, h.body); err != nil {
+			t.Errorf("request %d does not match the webhook in api/openapi.yaml: %v", i, err)
 		}
 	}
 }
@@ -1198,8 +1233,15 @@ func TestPrivateDestinationsAreRefusedAtDialTime(t *testing.T) {
 		t.Fatal("the worker connected to a loopback address")
 	}
 	a := f.attempts(f.only().ID)
-	if len(a) != 1 || a[0].Error == nil || !strings.Contains(*a[0].Error, "not allowed: loopback") {
+	if len(a) != 1 || a[0].Error == nil || !strings.Contains(*a[0].Error, "not allowed (loopback address)") {
 		t.Errorf("the attempt should record the refusal: %+v", a)
+	}
+	// The tenant sees why, the operator's log also sees where.
+	if len(a) == 1 && a[0].Error != nil && strings.Contains(*a[0].Error, "127.0.0.1") {
+		t.Errorf("the stored error names the address: %q", *a[0].Error)
+	}
+	if !strings.Contains(f.logs.String(), "destination 127.0.0.1 is not allowed") {
+		t.Error("the worker log lacks the refused address")
 	}
 	f.assertInvariant()
 }

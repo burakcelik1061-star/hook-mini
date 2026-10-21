@@ -16,11 +16,34 @@ import (
 	"github.com/burakcelik1061-star/hook-mini/db/migrations"
 )
 
+// sessionDefaults are server-side limits set on every pooled connection
+// unless the connection string sets them itself. HTTP request contexts carry
+// no deadline, so without them one query stuck behind a lock (or a
+// transaction left open by a bug) would hold its pool connection, and
+// eventually all of them, indefinitely. Every query in this service takes
+// milliseconds; the limits only end the pathological case, which then
+// surfaces as an error instead of a hang. Migrations use their own
+// connection and are not affected.
+var sessionDefaults = map[string]string{
+	"statement_timeout":                   "30s",
+	"lock_timeout":                        "10s",
+	"idle_in_transaction_session_timeout": "60s",
+}
+
 // Connect opens a pool and waits until Postgres answers a ping. Containers
 // start in no guaranteed order, so a short retry window is part of the
 // contract: it returns only when the database is usable or ctx is done.
 func Connect(ctx context.Context, log *slog.Logger, url string) (*pgxpool.Pool, error) {
-	pool, err := pgxpool.New(ctx, url)
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, fmt.Errorf("parse database URL: %w", err)
+	}
+	for k, v := range sessionDefaults {
+		if _, set := cfg.ConnConfig.RuntimeParams[k]; !set {
+			cfg.ConnConfig.RuntimeParams[k] = v
+		}
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("open pool: %w", err)
 	}

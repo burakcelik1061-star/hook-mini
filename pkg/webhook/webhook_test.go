@@ -57,6 +57,20 @@ func TestVerifyAcceptsTheSpecificationExample(t *testing.T) {
 	}
 }
 
+func TestVerifyBoundsTheNumberOfSignatures(t *testing.T) {
+	decoy := "v1," + strings.Repeat("A", 43) + "="
+	header := func(decoys int) string {
+		return strings.Repeat(decoy+" ", decoys) + specSigning // the real one last
+	}
+	v := specVerifier(t, "whsec_"+strings.Repeat("A", 32), specSecret) // two keys, as during a rotation
+	if err := v.Verify(specHeaders(header(MaxSignatures-1)), []byte(specBody)); err != nil {
+		t.Errorf("%d signatures: %v, want accepted", MaxSignatures, err)
+	}
+	if err := v.Verify(specHeaders(header(MaxSignatures)), []byte(specBody)); !errors.Is(err, ErrTooManySignatures) {
+		t.Errorf("%d signatures: %v, want ErrTooManySignatures", MaxSignatures+1, err)
+	}
+}
+
 func TestVerifyRejectsTampering(t *testing.T) {
 	v := specVerifier(t)
 	body := []byte(specBody)

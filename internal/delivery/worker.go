@@ -83,7 +83,7 @@ func DefaultConfig() Config {
 		PollInterval:   500 * time.Millisecond,
 		LeaseDuration:  60 * time.Second,
 		RequestTimeout: 15 * time.Second,
-		DrainTimeout:   15 * time.Second,
+		DrainTimeout:   20 * time.Second,
 		Retry:          DefaultRetryPolicy(),
 	}
 }
@@ -291,6 +291,10 @@ func (w *Worker) process(ctx context.Context, job store.ClaimDueDeliveriesRow) {
 // attempt row and the endpoint's failure counter, all in one transaction and
 // all fenced by the lease token.
 func (w *Worker) record(log *slog.Logger, job store.ClaimDueDeliveriesRow, res result) {
+	if res.interrupted {
+		w.recordInterrupted(log, job, res)
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
 	defer cancel()
 
@@ -384,6 +388,9 @@ func (w *Worker) record(log *slog.Logger, job store.ClaimDueDeliveriesRow, res r
 			"limit", w.cfg.AutoDisableAfter)
 	}
 	attrs := []any{"status_code", res.statusCode, "duration_ms", res.duration.Milliseconds()}
+	if res.detail != "" {
+		attrs = append(attrs, "detail", res.detail)
+	}
 	switch {
 	case errors.Is(err, errLeaseLost):
 		log.Warn("result discarded: the lease was lost (expired and reclaimed, or the delivery was deleted)", attrs...)
@@ -397,6 +404,50 @@ func (w *Worker) record(log *slog.Logger, job store.ClaimDueDeliveriesRow, res r
 		log.Warn("attempt failed; will retry", append(attrs, "error", res.errText, "retry_in", delay.Round(time.Millisecond))...)
 	default:
 		log.Warn("attempt failed; giving up after the last attempt", append(attrs, "error", res.errText)...)
+	}
+}
+
+// recordInterrupted writes an attempt the worker cancelled itself because
+// draining took too long. The endpoint did nothing wrong, so its failure
+// counter is left alone and the attempt does not use up the delivery's retry
+// budget; otherwise every slow shutdown could kill deliveries that were on
+// their last attempt and push healthy endpoints towards being disabled.
+//
+// Only the delivery row is locked here (the attempt row's foreign key points
+// at that same row), so this cannot deadlock with an endpoint being deleted,
+// which locks the endpoint first and then its deliveries.
+func (w *Worker) recordInterrupted(log *slog.Logger, job store.ClaimDueDeliveriesRow, res result) {
+	ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
+	defer cancel()
+
+	err := pgx.BeginFunc(ctx, w.pool, func(tx pgx.Tx) error {
+		q := w.q.WithTx(tx)
+		n, err := q.ReturnInterruptedDelivery(ctx, store.ReturnInterruptedDeliveryParams{
+			ID: job.ID, LeaseToken: job.LeaseToken, LastError: res.errText,
+		})
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return errLeaseLost
+		}
+		_, err = q.CreateDeliveryAttempt(ctx, store.CreateDeliveryAttemptParams{
+			DeliveryID: job.ID,
+			AttemptNo:  job.AttemptCount + 1,
+			StartedAt:  res.started,
+			DurationMs: int32(min(res.duration.Milliseconds(), math.MaxInt32)),
+			Error:      nonEmpty(res.errText),
+		})
+		return err
+	})
+	switch {
+	case errors.Is(err, errLeaseLost):
+		log.Warn("interrupted attempt discarded: the lease was lost")
+	case err != nil:
+		log.Error("recording the interrupted attempt failed", "error", err)
+	default:
+		log.Warn("attempt interrupted by shutdown; the delivery is queued again without using up a retry",
+			"duration_ms", res.duration.Milliseconds())
 	}
 }
 

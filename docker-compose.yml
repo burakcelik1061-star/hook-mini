@@ -37,6 +37,9 @@ services:
     image: hook-mini:dev
     command: ["api"]
     environment: *app-env
+    # Docker sends SIGKILL after 10s by default, which would cut the graceful
+    # shutdown (SHUTDOWN_TIMEOUT, 20s by default) short. Keep this above it.
+    stop_grace_period: 30s
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
@@ -46,6 +49,9 @@ services:
   worker:
     image: hook-mini:dev
     command: ["worker"]
+    # Above SHUTDOWN_TIMEOUT (see api), so attempts in flight can finish and
+    # be recorded instead of being killed and retried.
+    stop_grace_period: 30s
     environment:
       <<: *app-env
       # Overridable from the shell for demos, e.g.
@@ -66,8 +72,10 @@ services:
   # http://receiver:9000/anything (or /status/503 to watch retries). Set
   # RECEIVER_SECRETS to an endpoint's secret to have signatures verified.
   receiver:
-    image: hook-mini:dev
-    command: ["receiver"]
+    build:
+      context: .
+      target: receiver
+    image: hook-mini-receiver:dev
     profiles: ["demo"]
     environment:
       RECEIVER_SECRETS: ${RECEIVER_SECRETS:-}

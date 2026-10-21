@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/burakcelik1061-star/hook-mini/internal/database"
@@ -777,6 +779,57 @@ func TestReplayDelivery(t *testing.T) {
 	}
 	if _, err := s.ReplayDelivery(ctx(), a.ID, uuid.New()); !errors.Is(err, ErrNotFound) {
 		t.Errorf("unknown delivery: %v", err)
+	}
+}
+
+// interceptDB runs before() once, just ahead of the first query with the
+// given sqlc name. It places a concurrent change at an exact point inside a
+// use case, which a real race would hit only rarely.
+type interceptDB struct {
+	store.DBTX
+	name   string
+	before func()
+	once   sync.Once
+}
+
+func (d *interceptDB) hook(sql string) {
+	if strings.HasPrefix(sql, "-- name: "+d.name+" ") {
+		d.once.Do(d.before)
+	}
+}
+
+func (d *interceptDB) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	d.hook(sql)
+	return d.DBTX.Exec(ctx, sql, args...)
+}
+
+func (d *interceptDB) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	d.hook(sql)
+	return d.DBTX.Query(ctx, sql, args...)
+}
+
+func (d *interceptDB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	d.hook(sql)
+	return d.DBTX.QueryRow(ctx, sql, args...)
+}
+
+// Replay reads the delivery, then its endpoint, then updates. An endpoint
+// deleted (taking its deliveries with it) at either gap is a 404, not a 500
+// or a misleading 409.
+func TestReplayWhileTheEndpointIsDeleted(t *testing.T) {
+	s := newService(t)
+	a := newTenant(t, s)
+	for _, gap := range []string{"GetEndpoint", "ReplayDelivery"} {
+		ep, d := deliveryFixture(t, s, a.ID, "dead")
+		racing := *s
+		racing.q = store.New(&interceptDB{DBTX: testPool, name: gap, before: func() {
+			if err := s.DeleteEndpoint(ctx(), a.ID, ep.ID); err != nil {
+				t.Fatalf("DeleteEndpoint: %v", err)
+			}
+		}})
+		if _, err := racing.ReplayDelivery(ctx(), a.ID, d.ID); !errors.Is(err, ErrNotFound) {
+			t.Errorf("endpoint deleted just before %s: err = %v, want ErrNotFound", gap, err)
+		}
 	}
 }
 

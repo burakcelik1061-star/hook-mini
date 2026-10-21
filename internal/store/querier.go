@@ -125,6 +125,12 @@ type Querier interface {
 	// finds the row pending and changes nothing). The retry budget starts over
 	// (round_base), the attempt history is kept.
 	ReplayDelivery(ctx context.Context, arg ReplayDeliveryParams) (Delivery, error)
+	// Hands back a delivery whose attempt the worker itself cut short while
+	// shutting down. The attempt is recorded (the request may have reached the
+	// endpoint) but is not held against the delivery: round_base moves along
+	// with attempt_count, so the retry budget is unchanged, and it is due again
+	// at once.
+	ReturnInterruptedDelivery(ctx context.Context, arg ReturnInterruptedDeliveryParams) (int64, error)
 	// Returns no row if the key does not exist for this tenant or is already revoked.
 	RevokeAPIKey(ctx context.Context, arg RevokeAPIKeyParams) (uuid.UUID, error)
 	// The current secret becomes the previous one, valid for grace_ms more; a

@@ -27,8 +27,8 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.LogFormat != "json" {
 		t.Errorf("LogFormat = %q, want json", cfg.LogFormat)
 	}
-	if cfg.ShutdownTimeout != 15*time.Second {
-		t.Errorf("ShutdownTimeout = %v, want 15s", cfg.ShutdownTimeout)
+	if cfg.ShutdownTimeout != 20*time.Second {
+		t.Errorf("ShutdownTimeout = %v, want 20s", cfg.ShutdownTimeout)
 	}
 }
 
@@ -38,13 +38,13 @@ func TestLoadOverrides(t *testing.T) {
 		"HTTP_ADDR":        "127.0.0.1:9000",
 		"LOG_LEVEL":        "debug",
 		"LOG_FORMAT":       "TEXT",
-		"SHUTDOWN_TIMEOUT": "2s",
+		"SHUTDOWN_TIMEOUT": "45s",
 	}))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
 	if cfg.HTTPAddr != "127.0.0.1:9000" || cfg.LogLevel != slog.LevelDebug ||
-		cfg.LogFormat != "text" || cfg.ShutdownTimeout != 2*time.Second {
+		cfg.LogFormat != "text" || cfg.ShutdownTimeout != 45*time.Second {
 		t.Errorf("unexpected config: %+v", cfg)
 	}
 }
@@ -91,6 +91,7 @@ func TestWorkerOverrides(t *testing.T) {
 		"WORKER_POLL_INTERVAL":     "250ms",
 		"WORKER_LEASE_DURATION":    "2m",
 		"DELIVERY_TIMEOUT":         "30s",
+		"SHUTDOWN_TIMEOUT":         "35s",
 		"DELIVERY_MAX_ATTEMPTS":    "3",
 		"DELIVERY_BACKOFF_INITIAL": "1s",
 		"DELIVERY_BACKOFF_MAX":     "1m",
@@ -120,6 +121,14 @@ func TestWorkerValidation(t *testing.T) {
 		"lease shorter than request": {
 			map[string]string{"WORKER_LEASE_DURATION": "10s", "DELIVERY_TIMEOUT": "15s"},
 			"WORKER_LEASE_DURATION (10s) must be at least DELIVERY_TIMEOUT (15s) plus 5s",
+		},
+		"shutdown shorter than request": {
+			map[string]string{"SHUTDOWN_TIMEOUT": "19s", "DELIVERY_TIMEOUT": "15s"},
+			"SHUTDOWN_TIMEOUT (19s) must be at least DELIVERY_TIMEOUT (15s) plus 5s",
+		},
+		"default shutdown too short for a raised request timeout": {
+			map[string]string{"DELIVERY_TIMEOUT": "30s", "WORKER_LEASE_DURATION": "2m"},
+			"SHUTDOWN_TIMEOUT (20s) must be at least DELIVERY_TIMEOUT (30s) plus 5s",
 		},
 		"backoff max below initial": {
 			map[string]string{"DELIVERY_BACKOFF_INITIAL": "1h", "DELIVERY_BACKOFF_MAX": "1m"},

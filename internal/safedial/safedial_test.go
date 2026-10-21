@@ -56,6 +56,17 @@ func TestCheckBlocksNonPublicAddresses(t *testing.T) {
 		"2001:0:4136:e378::1":    "Teredo",
 		"2001:db8::1":            "documentation",
 		"100::1":                 "discard",
+		"2001:2::1":              "IETF protocol assignments", // benchmarking
+		"3fff::1":                "documentation",
+		// Outside 2000::/3: IsGlobalUnicast accepts all of these.
+		"::a00:5":        "2000::/3", // IPv4-compatible form of 10.0.0.5
+		"::7f00:1":       "2000::/3", // IPv4-compatible form of 127.0.0.1
+		"::ffff:0:a00:5": "2000::/3", // SIIT form of 10.0.0.5
+		"fec0::1":        "2000::/3", // deprecated site-local
+		"4000::1":        "2000::/3", // unassigned
+		// Azure's WireServer: public-looking, reachable only from inside.
+		"168.63.129.16":        "Azure WireServer",
+		"::ffff:168.63.129.16": "Azure WireServer",
 	}
 	p := Policy{}
 	for s, want := range blocked {
@@ -77,6 +88,10 @@ func TestCheckAllowsPublicAddresses(t *testing.T) {
 		"1.1.1.1", "8.8.8.8", "93.184.216.34", "172.15.255.255", "172.32.0.1",
 		"100.63.255.255", "100.128.0.1", "192.169.0.1", "2606:4700:4700::1111", "2a00:1450:4001::200e",
 		"::ffff:8.8.8.8",
+		// Just outside 2001::/23, and either side of the WireServer address.
+		"2001:4860:4860::8888", "168.63.129.15", "168.63.129.17",
+		// The top half of 2000::/3 is global unicast too.
+		"3000::1", "3ffe::1",
 	} {
 		if err := p.Check(netip.MustParseAddr(s)); err != nil {
 			t.Errorf("%s: %v, want allowed", s, err)
@@ -179,6 +194,17 @@ func TestTransportIgnoresProxyEnvironment(t *testing.T) {
 	}
 	if reachedProxy.Load() {
 		t.Error("the request went to HTTP_PROXY")
+	}
+}
+
+func TestTransportBoundsResponseHeaders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Padding", strings.Repeat("a", 200<<10))
+	}))
+	defer srv.Close()
+	err := get(Policy{AllowPrivate: true}.Transport(), srv.URL)
+	if err == nil || !strings.Contains(err.Error(), "headers exceeded") {
+		t.Fatalf("err = %v, want 200 KB of response headers to be refused", err)
 	}
 }
 

@@ -110,7 +110,7 @@ func Load(getenv func(string) string) (Config, error) {
 		return n
 	}
 
-	cfg.ShutdownTimeout = duration("SHUTDOWN_TIMEOUT", "15s", time.Second, 10*time.Minute)
+	cfg.ShutdownTimeout = duration("SHUTDOWN_TIMEOUT", "20s", time.Second, 10*time.Minute)
 
 	switch v := strings.ToLower(get("ALLOW_PRIVATE_DESTINATIONS", "false")); v {
 	case "true", "1":
@@ -137,6 +137,12 @@ func Load(getenv func(string) string) (Config, error) {
 	// let healthy attempts be reclaimed and sent twice.
 	if w.LeaseDuration > 0 && w.RequestTimeout > 0 && w.LeaseDuration < w.RequestTimeout+5*time.Second {
 		fail("WORKER_LEASE_DURATION (%s) must be at least DELIVERY_TIMEOUT (%s) plus 5s", w.LeaseDuration, w.RequestTimeout)
+	}
+	// The worker drains for SHUTDOWN_TIMEOUT. Shorter than one request (plus
+	// time to record it) and every deploy would cut off slow attempts that
+	// would have finished, sending them again.
+	if cfg.ShutdownTimeout > 0 && w.RequestTimeout > 0 && cfg.ShutdownTimeout < w.RequestTimeout+5*time.Second {
+		fail("SHUTDOWN_TIMEOUT (%s) must be at least DELIVERY_TIMEOUT (%s) plus 5s", cfg.ShutdownTimeout, w.RequestTimeout)
 	}
 	if w.BackoffMax < w.BackoffInitial {
 		fail("DELIVERY_BACKOFF_MAX (%s) must not be smaller than DELIVERY_BACKOFF_INITIAL (%s)", w.BackoffMax, w.BackoffInitial)

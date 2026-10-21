@@ -49,15 +49,21 @@ const SecretPrefix = "whsec_"
 // receiver's clock, in either direction.
 const DefaultTolerance = 5 * time.Minute
 
+// MaxSignatures is the most signatures Verify accepts in one header. A
+// sender adds one per active secret (two during a rotation); the bound stops
+// a forged header from making each request cost thousands of decodes.
+const MaxSignatures = 16
+
 // Verification errors. They are distinct so a receiver can log the reason;
 // the sender should only ever be told "unauthorized".
 var (
-	ErrMissingHeaders   = errors.New("webhook: missing webhook-id, webhook-timestamp or webhook-signature header")
-	ErrInvalidTimestamp = errors.New("webhook: invalid webhook-timestamp header")
-	ErrTimestampTooOld  = errors.New("webhook: timestamp is too old")
-	ErrTimestampTooNew  = errors.New("webhook: timestamp is too far in the future")
-	ErrNoMatch          = errors.New("webhook: no signature matches")
-	ErrInvalidSecret    = errors.New("webhook: secret must be whsec_ followed by base64")
+	ErrMissingHeaders    = errors.New("webhook: missing webhook-id, webhook-timestamp or webhook-signature header")
+	ErrInvalidTimestamp  = errors.New("webhook: invalid webhook-timestamp header")
+	ErrTimestampTooOld   = errors.New("webhook: timestamp is too old")
+	ErrTimestampTooNew   = errors.New("webhook: timestamp is too far in the future")
+	ErrNoMatch           = errors.New("webhook: no signature matches")
+	ErrTooManySignatures = errors.New("webhook: too many signatures in the webhook-signature header")
+	ErrInvalidSecret     = errors.New("webhook: secret must be whsec_ followed by base64")
 )
 
 // DecodeSecret returns the key bytes of a "whsec_<base64>" secret. Standard
@@ -154,15 +160,26 @@ func (v *Verifier) Verify(h http.Header, body []byte) error {
 		return ErrTimestampTooNew
 	}
 
+	// Decode each signature once, not once per key, and refuse a header with
+	// more signatures than any sender has reason to send.
+	var candidates [][]byte
+	n := 0
+	for sig := range strings.FieldsSeq(sigs) {
+		if n++; n > MaxSignatures {
+			return ErrTooManySignatures
+		}
+		version, b64, ok := strings.Cut(sig, ",")
+		if !ok || version != "v1" {
+			continue // unknown versions are ignored, as the standard requires
+		}
+		if got, err := base64.StdEncoding.DecodeString(b64); err == nil {
+			candidates = append(candidates, got)
+		}
+	}
 	for _, key := range v.keys {
 		expected := mac(key, id, unix, body)
-		for _, sig := range strings.Fields(sigs) {
-			version, b64, ok := strings.Cut(sig, ",")
-			if !ok || version != "v1" {
-				continue // unknown versions are ignored, as the standard requires
-			}
-			got, err := base64.StdEncoding.DecodeString(b64)
-			if err == nil && hmac.Equal(got, expected) {
+		for _, got := range candidates {
+			if hmac.Equal(got, expected) {
 				return nil
 			}
 		}

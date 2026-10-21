@@ -104,6 +104,24 @@ SET status           = 'dead',
     last_error       = sqlc.arg(last_error)::text
 WHERE id = sqlc.arg(id) AND lease_token = sqlc.arg(lease_token)::uuid AND status = 'in_flight';
 
+-- name: ReturnInterruptedDelivery :execrows
+-- Hands back a delivery whose attempt the worker itself cut short while
+-- shutting down. The attempt is recorded (the request may have reached the
+-- endpoint) but is not held against the delivery: round_base moves along
+-- with attempt_count, so the retry budget is unchanged, and it is due again
+-- at once.
+UPDATE deliveries
+SET status           = 'pending',
+    attempt_count    = attempt_count + 1,
+    round_base       = round_base + 1,
+    next_attempt_at  = now(),
+    locked_until     = NULL,
+    locked_by        = NULL,
+    lease_token      = NULL,
+    last_status_code = NULL,
+    last_error       = sqlc.arg(last_error)::text
+WHERE id = sqlc.arg(id) AND lease_token = sqlc.arg(lease_token)::uuid AND status = 'in_flight';
+
 -- name: ReclaimExpiredLeases :many
 -- Returns deliveries whose worker vanished (crashed, was killed, lost its
 -- network) to the queue. The lost attempt counts: the request may well have

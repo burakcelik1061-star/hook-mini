@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/pressly/goose/v3"
 	"github.com/pressly/goose/v3/lock"
 
@@ -257,6 +259,64 @@ func TestMigrationsRoundTrip(t *testing.T) {
 	}
 	if again := userTables(); !slices.Equal(again, upTables) {
 		t.Fatalf("schema after down+up differs:\n got %v\nwant %v", again, upTables)
+	}
+}
+
+// Every pooled connection carries the server-side limits, and a query stuck
+// behind a lock fails instead of holding its connection for ever. A value in
+// the connection string wins over the default.
+func TestConnectSetsSessionLimits(t *testing.T) {
+	base := testURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool, err := Connect(ctx, quiet(), base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	for setting, want := range map[string]string{
+		"statement_timeout": "30s", "lock_timeout": "10s", "idle_in_transaction_session_timeout": "1min",
+	} {
+		var got string
+		if err := pool.QueryRow(ctx, "SELECT current_setting($1)", setting).Scan(&got); err != nil || got != want {
+			t.Errorf("%s = %q (err %v), want %q", setting, got, err, want)
+		}
+	}
+
+	u, _ := url.Parse(base)
+	q := u.Query()
+	q.Set("lock_timeout", "200")
+	u.RawQuery = q.Encode()
+	short, err := Connect(ctx, quiet(), u.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer short.Close()
+
+	var got string
+	if err := short.QueryRow(ctx, "SELECT current_setting('lock_timeout')").Scan(&got); err != nil || got != "200ms" {
+		t.Errorf("lock_timeout from the URL = %q (err %v), want 200ms", got, err)
+	}
+
+	// One session holds a lock; a session waiting for it gives up instead of
+	// waiting for as long as the holder likes.
+	holder, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(ctx)
+	if _, err := holder.Exec(ctx, `SELECT pg_advisory_xact_lock(4242)`); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err = short.Exec(ctx, `SELECT pg_advisory_xact_lock(4242)`)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" { // lock_not_available
+		t.Fatalf("err = %v, want a lock timeout", err)
+	}
+	if waited := time.Since(start); waited > 5*time.Second {
+		t.Errorf("waited %s for the lock despite lock_timeout=200ms", waited)
 	}
 }
 
