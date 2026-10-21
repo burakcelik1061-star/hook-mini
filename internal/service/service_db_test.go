@@ -553,4 +553,256 @@ func TestListEventsPagination(t *testing.T) {
 	}
 }
 
+// deliveryFixture creates an endpoint and one delivery for it, then forces the
+// delivery into the given state (nothing here runs a worker).
+func deliveryFixture(t *testing.T, s *Service, tenant uuid.UUID, status string) (store.Endpoint, store.Delivery) {
+	t.Helper()
+	ep := newEndpoint(t, s, tenant)
+	res, err := s.IngestEvent(ctx(), tenant, IngestInput{Type: "a.b", Payload: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var d store.Delivery
+	rows, err := s.q.ListDeliveries(ctx(), store.ListDeliveriesParams{TenantID: tenant, EventID: &res.Event.ID, EndpointID: &ep.ID, PageSize: 10})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("expected one delivery: %v (%d)", err, len(rows))
+	}
+	d = rows[0]
+	switch status {
+	case "pending":
+	case "dead", "succeeded":
+		if _, err := testPool.Exec(ctx(), `UPDATE deliveries SET status = $2, attempt_count = 3, completed_at = now(), last_error = 'earlier failure' WHERE id = $1`, d.ID, status); err != nil {
+			t.Fatal(err)
+		}
+	case "in_flight":
+		if _, err := testPool.Exec(ctx(), `UPDATE deliveries SET status = 'in_flight', locked_until = now() + interval '1 minute', locked_by = 'w', lease_token = gen_random_uuid() WHERE id = $1`, d.ID); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatalf("unknown status %q", status)
+	}
+	d, _ = s.q.GetDelivery(ctx(), store.GetDeliveryParams{ID: d.ID, TenantID: tenant})
+	return ep, d
+}
+
+func TestListDeliveriesFiltersAndValidates(t *testing.T) {
+	s := newService(t)
+	a, b := newTenant(t, s), newTenant(t, s)
+	deliveryFixture(t, s, b.ID, "dead") // another tenant's, must never show up
+
+	// Two endpoints and two events: four deliveries, with controlled states.
+	ep1, ep2 := newEndpoint(t, s, a.ID), newEndpoint(t, s, a.ID)
+	var events []uuid.UUID
+	for range 2 {
+		res, err := s.IngestEvent(ctx(), a.ID, IngestInput{Type: "a.b", Payload: json.RawMessage(`{}`)})
+		if err != nil || res.DeliveryCount != 2 {
+			t.Fatalf("ingest: %v (%d deliveries)", err, res.DeliveryCount)
+		}
+		events = append(events, res.Event.ID)
+	}
+	// event 0 -> ep1 dead; everything else stays pending.
+	if _, err := testPool.Exec(ctx(), `UPDATE deliveries SET status = 'dead', attempt_count = 1, completed_at = now()
+		WHERE event_id = $1 AND endpoint_id = $2`, events[0], ep1.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	count := func(f DeliveryFilter) int {
+		t.Helper()
+		res, err := s.ListDeliveries(ctx(), a.ID, f, Page{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(res.Items)
+	}
+	if n := count(DeliveryFilter{}); n != 4 {
+		t.Errorf("unfiltered = %d, want 4 (another tenant's delivery must not appear)", n)
+	}
+	if n := count(DeliveryFilter{Status: "dead"}); n != 1 {
+		t.Errorf("status=dead: %d, want 1", n)
+	}
+	if n := count(DeliveryFilter{Status: "pending"}); n != 3 {
+		t.Errorf("status=pending: %d, want 3", n)
+	}
+	if n := count(DeliveryFilter{EndpointID: &ep2.ID}); n != 2 {
+		t.Errorf("by endpoint: %d, want 2", n)
+	}
+	if n := count(DeliveryFilter{EventID: &events[0]}); n != 2 {
+		t.Errorf("by event: %d, want 2", n)
+	}
+	if n := count(DeliveryFilter{EndpointID: &ep1.ID, EventID: &events[0], Status: "dead"}); n != 1 {
+		t.Errorf("all three filters: %d, want 1", n)
+	}
+	if n := count(DeliveryFilter{EndpointID: &ep2.ID, Status: "dead"}); n != 0 {
+		t.Errorf("endpoint+status mismatch: %d, want 0", n)
+	}
+	_, err := s.ListDeliveries(ctx(), a.ID, DeliveryFilter{Status: "failed"}, Page{})
+	wantField(t, err, "status")
+}
+
+func TestGetDeliveryReturnsAttemptsInOrder(t *testing.T) {
+	s := newService(t)
+	a, b := newTenant(t, s), newTenant(t, s)
+	_, d := deliveryFixture(t, s, a.ID, "dead")
+	for n := int32(3); n >= 1; n-- { // inserted out of order on purpose
+		if _, err := s.q.CreateDeliveryAttempt(ctx(), store.CreateDeliveryAttemptParams{
+			DeliveryID: d.ID, AttemptNo: n, StartedAt: time.Now(), DurationMs: 1, StatusCode: ptr(int32(500)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.GetDelivery(ctx(), a.ID, d.ID)
+	if err != nil || len(got.Attempts) != 3 {
+		t.Fatalf("GetDelivery: %d attempts, err=%v", len(got.Attempts), err)
+	}
+	for i, at := range got.Attempts {
+		if at.AttemptNo != int32(i+1) {
+			t.Errorf("attempt %d has number %d", i, at.AttemptNo)
+		}
+	}
+	if _, err := s.GetDelivery(ctx(), b.ID, d.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("another tenant reads the delivery: %v", err)
+	}
+}
+
+func TestReplayDelivery(t *testing.T) {
+	s := newService(t)
+	a, b := newTenant(t, s), newTenant(t, s)
+
+	for _, status := range []string{"dead", "succeeded"} {
+		_, d := deliveryFixture(t, s, a.ID, status)
+		got, err := s.ReplayDelivery(ctx(), a.ID, d.ID)
+		if err != nil {
+			t.Fatalf("%s: %v", status, err)
+		}
+		if got.Status != "pending" || got.RoundBase != 3 || got.AttemptCount != 3 || got.CompletedAt != nil {
+			t.Errorf("%s replay: %+v, want pending, round_base=3, attempt_count kept, completed_at cleared", status, got)
+		}
+		if time.Since(got.NextAttemptAt) < -time.Second {
+			t.Errorf("replayed delivery is not due now: %v", got.NextAttemptAt)
+		}
+	}
+
+	// Not finished yet: conflict, nothing changes.
+	for _, status := range []string{"pending", "in_flight"} {
+		_, d := deliveryFixture(t, s, a.ID, status)
+		_, err := s.ReplayDelivery(ctx(), a.ID, d.ID)
+		var ce *ConflictError
+		if !errors.As(err, &ce) || ce.Code != ConflictNotReplayable {
+			t.Errorf("%s: err = %v, want %s", status, err, ConflictNotReplayable)
+		}
+		if after, _ := s.q.GetDelivery(ctx(), store.GetDeliveryParams{ID: d.ID, TenantID: a.ID}); after.Status != status || after.RoundBase != 0 {
+			t.Errorf("a refused replay changed the %s delivery: %+v", status, after)
+		}
+	}
+
+	// A disabled endpoint would only abandon it again.
+	ep, d := deliveryFixture(t, s, a.ID, "dead")
+	if _, err := s.DisableEndpoint(ctx(), a.ID, ep.ID); err != nil {
+		t.Fatal(err)
+	}
+	var ce *ConflictError
+	if _, err := s.ReplayDelivery(ctx(), a.ID, d.ID); !errors.As(err, &ce) || ce.Code != ConflictEndpointDisabled {
+		t.Errorf("disabled endpoint: err = %v, want %s", err, ConflictEndpointDisabled)
+	}
+	if _, err := s.EnableEndpoint(ctx(), a.ID, ep.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReplayDelivery(ctx(), a.ID, d.ID); err != nil {
+		t.Errorf("after enabling the endpoint: %v", err)
+	}
+
+	// Another tenant, and ids that do not exist.
+	_, other := deliveryFixture(t, s, a.ID, "dead")
+	if _, err := s.ReplayDelivery(ctx(), b.ID, other.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("replay by another tenant: %v, want ErrNotFound", err)
+	}
+	if after, _ := s.q.GetDelivery(ctx(), store.GetDeliveryParams{ID: other.ID, TenantID: a.ID}); after.Status != "dead" {
+		t.Error("another tenant's replay attempt changed the delivery")
+	}
+	if _, err := s.ReplayDelivery(ctx(), a.ID, uuid.New()); !errors.Is(err, ErrNotFound) {
+		t.Errorf("unknown delivery: %v", err)
+	}
+}
+
+// Two clients pressing "replay" at once must queue the delivery once.
+func TestConcurrentReplaysQueueOneRound(t *testing.T) {
+	s := newService(t)
+	a := newTenant(t, s)
+	_, d := deliveryFixture(t, s, a.ID, "dead")
+
+	const clients = 16
+	var (
+		wg       sync.WaitGroup
+		start    = make(chan struct{})
+		mu       sync.Mutex
+		accepted int
+		refused  int
+		other    []error
+	)
+	for range clients {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := s.ReplayDelivery(ctx(), a.ID, d.ID)
+			var ce *ConflictError
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				accepted++
+			case errors.As(err, &ce) && ce.Code == ConflictNotReplayable:
+				refused++
+			default:
+				other = append(other, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if accepted != 1 || refused != clients-1 || len(other) != 0 {
+		t.Errorf("accepted=%d refused=%d other=%v, want 1, %d and none", accepted, refused, other, clients-1)
+	}
+}
+
+func TestDisableAndEnableEndpoint(t *testing.T) {
+	s := newService(t)
+	a, b := newTenant(t, s), newTenant(t, s)
+	ep := newEndpoint(t, s, a.ID)
+	if _, err := testPool.Exec(ctx(), `UPDATE endpoints SET consecutive_failures = 7 WHERE id = $1`, ep.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	off, err := s.DisableEndpoint(ctx(), a.ID, ep.ID)
+	if err != nil || off.Status != "disabled" || off.DisabledAt == nil || off.DisabledReason == nil || *off.DisabledReason != "disabled manually" {
+		t.Fatalf("DisableEndpoint: %+v err=%v", off, err)
+	}
+	// Idempotent: the first disable's timestamp and reason stay.
+	again, err := s.DisableEndpoint(ctx(), a.ID, ep.ID)
+	if err != nil || !again.DisabledAt.Equal(*off.DisabledAt) {
+		t.Errorf("second disable: %+v err=%v", again, err)
+	}
+	// A disabled endpoint receives no new deliveries from fan-out.
+	res, err := s.IngestEvent(ctx(), a.ID, IngestInput{Type: "a.b", Payload: json.RawMessage(`{}`)})
+	if err != nil || res.DeliveryCount != 0 {
+		t.Errorf("fan-out to a disabled endpoint: %d deliveries, err=%v", res.DeliveryCount, err)
+	}
+
+	on, err := s.EnableEndpoint(ctx(), a.ID, ep.ID)
+	if err != nil || on.Status != "active" || on.DisabledAt != nil || on.DisabledReason != nil || on.ConsecutiveFailures != 0 {
+		t.Errorf("EnableEndpoint: %+v err=%v, want active with the failure counter reset", on, err)
+	}
+
+	if _, err := s.DisableEndpoint(ctx(), b.ID, ep.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("disable by another tenant: %v", err)
+	}
+	if _, err := s.EnableEndpoint(ctx(), b.ID, ep.ID); !errors.Is(err, ErrNotFound) {
+		t.Errorf("enable by another tenant: %v", err)
+	}
+	if got, _ := s.GetEndpoint(ctx(), a.ID, ep.ID); got.Status != "active" {
+		t.Error("another tenant changed the endpoint's state")
+	}
+}
+
 func ptr[T any](v T) *T { return &v }

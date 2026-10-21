@@ -51,6 +51,7 @@ func run() error {
 			InitialBackoff: wc.BackoffInitial,
 			MaxBackoff:     wc.BackoffMax,
 		},
+		AutoDisableAfter:     wc.AutoDisableAfter,
 		AllowPrivateNetworks: cfg.AllowPrivateDestinations,
 	})
 	if err != nil {

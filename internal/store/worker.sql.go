@@ -38,6 +38,7 @@ RETURNING d.id,
           d.event_id,
           d.endpoint_id,
           d.attempt_count,
+          d.round_base,
           d.lease_token::uuid AS lease_token,
           e.type              AS event_type,
           e.payload           AS event_payload,
@@ -64,6 +65,7 @@ type ClaimDueDeliveriesRow struct {
 	EventID                uuid.UUID
 	EndpointID             uuid.UUID
 	AttemptCount           int32
+	RoundBase              int32
 	LeaseToken             uuid.UUID
 	EventType              string
 	EventPayload           json.RawMessage
@@ -114,6 +116,7 @@ func (q *Queries) ClaimDueDeliveries(ctx context.Context, arg ClaimDueDeliveries
 			&i.EventID,
 			&i.EndpointID,
 			&i.AttemptCount,
+			&i.RoundBase,
 			&i.LeaseToken,
 			&i.EventType,
 			&i.EventPayload,
@@ -214,8 +217,8 @@ WITH expired AS MATERIALIZED (
 )
 UPDATE deliveries d
 SET attempt_count    = d.attempt_count + 1,
-    status           = CASE WHEN d.attempt_count + 1 >= $1::int THEN 'dead' ELSE 'pending' END,
-    completed_at     = CASE WHEN d.attempt_count + 1 >= $1::int THEN now() END,
+    status           = CASE WHEN d.attempt_count + 1 - d.round_base >= $1::int THEN 'dead' ELSE 'pending' END,
+    completed_at     = CASE WHEN d.attempt_count + 1 - d.round_base >= $1::int THEN now() END,
     next_attempt_at  = now(),
     locked_until     = NULL,
     locked_by        = NULL,

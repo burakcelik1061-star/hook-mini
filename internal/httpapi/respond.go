@@ -42,11 +42,14 @@ func badRequest(field, message string) *apiError {
 func writeError(w http.ResponseWriter, r *http.Request, log *slog.Logger, err error) {
 	var apiErr *apiError
 	var ve *service.ValidationError
+	var ce *service.ConflictError
 
 	switch {
 	case errors.As(err, &apiErr):
 	case errors.As(err, &ve):
 		apiErr = badRequest(ve.Field, ve.Error())
+	case errors.As(err, &ce):
+		apiErr = &apiError{Status: http.StatusConflict, Code: ce.Code, Message: ce.Message}
 	case errors.Is(err, service.ErrNotFound):
 		apiErr = &apiError{Status: http.StatusNotFound, Code: "not_found", Message: "resource not found"}
 	case errors.Is(err, service.ErrUnauthorized):

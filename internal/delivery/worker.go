@@ -63,6 +63,10 @@ type Config struct {
 	DrainTimeout time.Duration
 	// Retry decides when to retry and when to give up.
 	Retry RetryPolicy
+	// AutoDisableAfter disables an endpoint once this many consecutive
+	// attempts to it have failed (any success resets the count). Zero turns
+	// the feature off.
+	AutoDisableAfter int
 	// AllowPrivateNetworks lets requests reach loopback, private and
 	// link-local addresses. Off by default; only for development and tests.
 	AllowPrivateNetworks bool
@@ -98,6 +102,8 @@ func (c Config) validate() error {
 		return errors.New("lease duration must be longer than the request timeout")
 	case c.ReapInterval < 0:
 		return errors.New("reap interval must not be negative")
+	case c.AutoDisableAfter < 0:
+		return errors.New("auto-disable threshold must not be negative")
 	case c.DrainTimeout <= 0:
 		return errors.New("drain timeout must be positive")
 	}
@@ -289,10 +295,14 @@ func (w *Worker) record(log *slog.Logger, job store.ClaimDueDeliveriesRow, res r
 	defer cancel()
 
 	attempt := job.AttemptCount + 1
+	// The retry budget is counted per round: a replayed delivery starts a new
+	// round (round_base), while attempt numbers keep counting up.
+	inRound := int(attempt - job.RoundBase)
 	code := statusCode(res.statusCode)
 	var (
-		outcome string
-		delay   time.Duration
+		outcome         string
+		delay           time.Duration
+		disabledByLimit bool
 	)
 
 	err := pgx.BeginFunc(ctx, w.pool, func(tx pgx.Tx) error {
@@ -308,7 +318,19 @@ func (w *Worker) record(log *slog.Logger, job store.ClaimDueDeliveriesRow, res r
 		if res.ok() {
 			err = q.RecordEndpointSuccess(ctx, job.EndpointID)
 		} else {
-			_, err = q.RecordEndpointFailure(ctx, job.EndpointID)
+			var failures int32
+			failures, err = q.RecordEndpointFailure(ctx, job.EndpointID)
+			if err == nil && w.cfg.AutoDisableAfter > 0 && int(failures) >= w.cfg.AutoDisableAfter {
+				// Too many failures in a row: stop sending to this endpoint
+				// until its owner enables it again. Idempotent: only an
+				// active endpoint changes, so the first reason is kept.
+				var n int64
+				n, err = q.DisableEndpoint(ctx, store.DisableEndpointParams{
+					ID:             job.EndpointID,
+					DisabledReason: ptr(fmt.Sprintf("disabled automatically after %d consecutive failed attempts", failures)),
+				})
+				disabledByLimit = n > 0
+			}
 		}
 		if err != nil {
 			return err
@@ -321,14 +343,14 @@ func (w *Worker) record(log *slog.Logger, job store.ClaimDueDeliveriesRow, res r
 			n, err = q.MarkDeliverySucceeded(ctx, store.MarkDeliverySucceededParams{
 				ID: job.ID, LeaseToken: job.LeaseToken, StatusCode: int32(res.statusCode),
 			})
-		case int(attempt) >= w.cfg.Retry.MaxAttempts:
+		case inRound >= w.cfg.Retry.MaxAttempts:
 			outcome = "dead"
 			n, err = q.MarkDeliveryDead(ctx, store.MarkDeliveryDeadParams{
 				ID: job.ID, LeaseToken: job.LeaseToken, AttemptsUsed: 1, StatusCode: code, LastError: res.errText,
 			})
 		default:
 			outcome = "retry"
-			delay = w.cfg.Retry.nextDelay(int(attempt), res.retryAfter)
+			delay = w.cfg.Retry.nextDelay(inRound, res.retryAfter)
 			n, err = q.ScheduleDeliveryRetry(ctx, store.ScheduleDeliveryRetryParams{
 				ID: job.ID, LeaseToken: job.LeaseToken, DelayMs: delay.Milliseconds(), StatusCode: code, LastError: res.errText,
 			})
@@ -352,6 +374,10 @@ func (w *Worker) record(log *slog.Logger, job store.ClaimDueDeliveriesRow, res r
 		return err
 	})
 
+	if err == nil && disabledByLimit {
+		log.Warn("endpoint disabled automatically: too many consecutive failed attempts",
+			"limit", w.cfg.AutoDisableAfter)
+	}
 	attrs := []any{"status_code", res.statusCode, "duration_ms", res.duration.Milliseconds()}
 	switch {
 	case errors.Is(err, errLeaseLost):
@@ -445,6 +471,8 @@ func (w *Worker) reapOnce(ctx context.Context) (int, error) {
 	}
 	return len(rows), nil
 }
+
+func ptr[T any](v T) *T { return &v }
 
 func sleep(ctx context.Context, d time.Duration) {
 	t := time.NewTimer(d)

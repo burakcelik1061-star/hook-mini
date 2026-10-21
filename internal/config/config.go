@@ -47,6 +47,9 @@ type Worker struct {
 	MaxAttempts    int
 	BackoffInitial time.Duration
 	BackoffMax     time.Duration
+	// AutoDisableAfter disables an endpoint after this many consecutive
+	// failed attempts; 0 turns it off.
+	AutoDisableAfter int
 }
 
 // Load builds a Config from getenv (usually os.Getenv). All problems are
@@ -127,6 +130,8 @@ func Load(getenv func(string) string) (Config, error) {
 		MaxAttempts:    integer("DELIVERY_MAX_ATTEMPTS", 8, 1, 50),
 		BackoffInitial: duration("DELIVERY_BACKOFF_INITIAL", "30s", 100*time.Millisecond, 24*time.Hour),
 		BackoffMax:     duration("DELIVERY_BACKOFF_MAX", "6h", 100*time.Millisecond, 7*24*time.Hour),
+
+		AutoDisableAfter: integer("ENDPOINT_AUTO_DISABLE_AFTER", 100, 0, 1_000_000),
 	}
 	// A lease shorter than a request (plus time to record the result) would
 	// let healthy attempts be reclaimed and sent twice.

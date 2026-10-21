@@ -38,6 +38,7 @@ type Delivery struct {
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 	LeaseToken     *uuid.UUID
+	RoundBase      int32
 }
 
 type DeliveryAttempt struct {

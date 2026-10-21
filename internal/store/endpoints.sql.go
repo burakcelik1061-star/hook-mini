@@ -92,6 +92,42 @@ func (q *Queries) DisableEndpoint(ctx context.Context, arg DisableEndpointParams
 	return result.RowsAffected(), nil
 }
 
+const disableEndpointForTenant = `-- name: DisableEndpointForTenant :one
+UPDATE endpoints
+SET status = 'disabled', disabled_at = now(), disabled_reason = $1::text
+WHERE id = $2 AND tenant_id = $3 AND status = 'active'
+RETURNING id, tenant_id, url, description, secret, status, consecutive_failures, disabled_at, disabled_reason, created_at, updated_at, previous_secret, previous_secret_expires_at
+`
+
+type DisableEndpointForTenantParams struct {
+	Reason   string
+	ID       uuid.UUID
+	TenantID uuid.UUID
+}
+
+// The tenant-scoped, manual counterpart of DisableEndpoint. Returns no row
+// when the endpoint is already disabled or does not exist for the tenant.
+func (q *Queries) DisableEndpointForTenant(ctx context.Context, arg DisableEndpointForTenantParams) (Endpoint, error) {
+	row := q.db.QueryRow(ctx, disableEndpointForTenant, arg.Reason, arg.ID, arg.TenantID)
+	var i Endpoint
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Url,
+		&i.Description,
+		&i.Secret,
+		&i.Status,
+		&i.ConsecutiveFailures,
+		&i.DisabledAt,
+		&i.DisabledReason,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.PreviousSecret,
+		&i.PreviousSecretExpiresAt,
+	)
+	return i, err
+}
+
 const enableEndpoint = `-- name: EnableEndpoint :one
 UPDATE endpoints
 SET status = 'active', disabled_at = NULL, disabled_reason = NULL, consecutive_failures = 0

@@ -60,6 +60,13 @@ func NewRouter(d Deps) http.Handler {
 				r.Patch("/{id}", h.updateEndpoint)
 				r.Delete("/{id}", h.deleteEndpoint)
 				r.Post("/{id}/rotate-secret", h.rotateSecret)
+				r.Post("/{id}/disable", h.disableEndpoint)
+				r.Post("/{id}/enable", h.enableEndpoint)
+			})
+			r.Route("/deliveries", func(r chi.Router) {
+				r.Get("/", h.listDeliveries)
+				r.Get("/{id}", h.getDelivery)
+				r.Post("/{id}/replay", h.replayDelivery)
 			})
 			r.Route("/events", func(r chi.Router) {
 				r.Post("/", h.createEvent)

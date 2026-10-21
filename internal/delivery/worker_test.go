@@ -519,7 +519,9 @@ func TestTimeoutIsAFailedAttempt(t *testing.T) {
 	f.waitStatus(5*time.Second, "dead", 1)
 
 	a := f.attempts(f.only().ID)
-	if len(a) != 1 || a[0].StatusCode != nil || a[0].Error == nil || !strings.Contains(*a[0].Error, "timeout") || a[0].DurationMs < 300 {
+	if len(a) != 1 || a[0].StatusCode != nil || a[0].Error == nil || !strings.Contains(*a[0].Error, "timeout") || a[0].DurationMs < 250 {
+		// (250, not 300: the stored milliseconds are truncated and timers
+		// may fire a hair early, so 299 is a legitimate reading.)
 		t.Errorf("unexpected attempt: %+v", a)
 	}
 	f.assertInvariant()
@@ -930,6 +932,179 @@ func TestEndpointDeletedWhileAttemptIsInFlight(t *testing.T) {
 	f.assertInvariant()
 }
 
+// ---- replay and automatic disabling ----
+
+func TestReplayStartsAFreshRetryBudget(t *testing.T) {
+	f := newFixture(t)
+	srv, rec := newRecorder(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	f.endpoint(srv.URL)
+	f.events(1)
+
+	f.start(testConfig("w-replay")) // 3 attempts per round
+	f.waitStatus(5*time.Second, "dead", 1)
+	d := f.only()
+	if d.AttemptCount != 3 || rec.count() != 3 {
+		t.Fatalf("first round: attempt_count=%d requests=%d, want 3 and 3", d.AttemptCount, rec.count())
+	}
+
+	if _, err := f.svc.ReplayDelivery(f.ctx, f.tenant, d.ID); err != nil {
+		t.Fatalf("ReplayDelivery: %v", err)
+	}
+	// Without a fresh budget the delivery would be dead again after one more
+	// attempt (attempt 4 >= 3); with one it gets a full second round.
+	f.waitFor(5*time.Second, "a second dead round", func() bool { return f.only().Status == "dead" && f.only().AttemptCount == 6 })
+
+	d = f.only()
+	if rec.count() != 6 || d.RoundBase != 3 {
+		t.Errorf("requests=%d round_base=%d, want 6 and 3", rec.count(), d.RoundBase)
+	}
+	a := f.attempts(d.ID)
+	for i, at := range a {
+		if at.AttemptNo != int32(i+1) {
+			t.Errorf("attempt %d is numbered %d: the history must keep counting up", i+1, at.AttemptNo)
+		}
+	}
+	f.assertInvariant()
+}
+
+func TestReplayOfASucceededDeliverySendsItAgain(t *testing.T) {
+	f := newFixture(t)
+	srv, rec := newRecorder(t, nil)
+	f.endpoint(srv.URL)
+	evID := f.events(1)[0]
+
+	f.start(testConfig("w-replay-ok"))
+	f.waitStatus(5*time.Second, "succeeded", 1)
+	if _, err := f.svc.ReplayDelivery(f.ctx, f.tenant, f.only().ID); err != nil {
+		t.Fatal(err)
+	}
+	f.waitFor(5*time.Second, "the replayed request", func() bool { return rec.count() == 2 })
+	f.waitStatus(5*time.Second, "succeeded", 1)
+
+	hits := rec.all()
+	if hits[0].webhookID != evID.String() || hits[1].webhookID != evID.String() {
+		t.Errorf("a replay must keep the event's webhook-id: %q then %q", hits[0].webhookID, hits[1].webhookID)
+	}
+	if d := f.only(); d.AttemptCount != 2 || len(f.attempts(d.ID)) != 2 {
+		t.Errorf("attempt_count=%d, want 2 with both attempts kept", d.AttemptCount)
+	}
+	f.assertInvariant()
+}
+
+func TestEndpointIsDisabledAfterTooManyConsecutiveFailures(t *testing.T) {
+	f := newFixture(t)
+	srv, rec := newRecorder(t, func(w http.ResponseWriter, _ *http.Request, _ int) {
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	ep := f.endpoint(srv.URL)
+	f.events(1)
+
+	cfg := testConfig("w-autodisable")
+	cfg.AutoDisableAfter = 3
+	cfg.Retry.MaxAttempts = 10
+	f.start(cfg)
+	f.waitStatus(5*time.Second, "dead", 1)
+
+	got, err := f.svc.GetEndpoint(f.ctx, f.tenant, ep)
+	if err != nil || got.Status != "disabled" || got.DisabledReason == nil || !strings.Contains(*got.DisabledReason, "3 consecutive") {
+		t.Fatalf("endpoint after the limit: %+v err=%v", got, err)
+	}
+	// Exactly three requests were made; the fourth attempt never happened.
+	d := f.only()
+	if rec.count() != 3 || d.AttemptCount != 3 {
+		t.Errorf("requests=%d attempt_count=%d, want 3 and 3", rec.count(), d.AttemptCount)
+	}
+	if d.LastError == nil || !strings.Contains(*d.LastError, "disabled") {
+		t.Errorf("last_error = %v, want it to say the endpoint is disabled", d.LastError)
+	}
+	if !strings.Contains(f.logs.String(), "endpoint disabled automatically") {
+		t.Error("the automatic disabling was not logged")
+	}
+	f.assertInvariant()
+}
+
+func TestASuccessResetsTheFailureStreak(t *testing.T) {
+	f := newFixture(t)
+	// Attempts 1, 2, 4 and 5 fail: never three in a row.
+	srv, _ := newRecorder(t, func(w http.ResponseWriter, _ *http.Request, n int) {
+		if n == 1 || n == 2 || n == 4 || n == 5 {
+			w.WriteHeader(http.StatusBadGateway)
+		}
+	})
+	ep := f.endpoint(srv.URL)
+
+	cfg := testConfig("w-streak")
+	cfg.AutoDisableAfter = 3
+	cfg.Retry.MaxAttempts = 5
+	f.start(cfg)
+	f.events(1)
+	f.waitStatus(5*time.Second, "succeeded", 1) // fail, fail, ok
+	f.events(1)
+	f.waitStatus(5*time.Second, "succeeded", 2) // fail, fail, ok
+
+	got, _ := f.svc.GetEndpoint(f.ctx, f.tenant, ep)
+	if got.Status != "active" || got.ConsecutiveFailures != 0 {
+		t.Errorf("endpoint = %s with %d consecutive failures; two failures in a row twice must not disable it", got.Status, got.ConsecutiveFailures)
+	}
+	f.assertInvariant()
+}
+
+func TestAutoDisableCanBeTurnedOff(t *testing.T) {
+	f := newFixture(t)
+	srv, _ := newRecorder(t, func(w http.ResponseWriter, _ *http.Request, _ int) { w.WriteHeader(500) })
+	ep := f.endpoint(srv.URL)
+	f.events(1)
+
+	cfg := testConfig("w-no-autodisable")
+	cfg.AutoDisableAfter = 0
+	cfg.Retry.MaxAttempts = 6
+	f.start(cfg)
+	f.waitStatus(5*time.Second, "dead", 1)
+	if got, _ := f.svc.GetEndpoint(f.ctx, f.tenant, ep); got.Status != "active" || got.ConsecutiveFailures != 6 {
+		t.Errorf("endpoint = %s (%d failures), want active with 6 failures", got.Status, got.ConsecutiveFailures)
+	}
+}
+
+// After a replay the retry budget is per round, so the reaper must not give
+// up on a replayed delivery just because its total attempt count is high.
+func TestReaperCountsAttemptsPerRound(t *testing.T) {
+	f := newFixture(t)
+	f.endpoint("https://example.invalid/hook")
+	f.events(1)
+	d := f.only()
+	for n := int32(1); n <= 3; n++ {
+		if _, err := f.q.CreateDeliveryAttempt(f.ctx, store.CreateDeliveryAttemptParams{
+			DeliveryID: d.ID, AttemptNo: n, StartedAt: time.Now(), DurationMs: 1, StatusCode: ptr(int32(500)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Three attempts happened and the delivery was replayed: round_base 3.
+	if _, err := testPool.Exec(f.ctx, `UPDATE deliveries SET attempt_count = 3, round_base = 3 WHERE id = $1`, d.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := testConfig("w-round")
+	cfg.LeaseDuration, cfg.RequestTimeout = 200*time.Millisecond, 100*time.Millisecond
+	w := f.worker(cfg) // MaxAttempts 3
+	if jobs, err := w.claim(f.ctx, 1); err != nil || len(jobs) != 1 || jobs[0].RoundBase != 3 {
+		t.Fatalf("claim: %v (%+v)", err, jobs)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n, err := w.reapOnce(f.ctx); err != nil || n != 1 {
+		t.Fatalf("reap: n=%d err=%v", n, err)
+	}
+
+	d = f.delivery(d.ID)
+	// Attempt 4 is the FIRST of the new round (4 - 3 = 1 < 3): still pending.
+	if d.Status != "pending" || d.AttemptCount != 4 {
+		t.Errorf("a replayed delivery was given up on too early: %+v", d)
+	}
+	f.assertInvariant()
+}
+
 func verifier(t *testing.T, secrets ...string) *webhook.Verifier {
 	t.Helper()
 	v, err := webhook.NewVerifier(secrets...)
@@ -1057,5 +1232,3 @@ func TestNewWorkerRejectsBadConfig(t *testing.T) {
 		t.Errorf("defaults not applied: batch=%d reap=%s id=%q", w.cfg.BatchSize, w.cfg.ReapInterval, w.ID())
 	}
 }
-
-func ptr[T any](v T) *T { return &v }

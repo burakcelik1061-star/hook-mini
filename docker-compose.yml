@@ -53,6 +53,7 @@ services:
       DELIVERY_BACKOFF_INITIAL: ${DELIVERY_BACKOFF_INITIAL:-30s}
       DELIVERY_BACKOFF_MAX: ${DELIVERY_BACKOFF_MAX:-6h}
       DELIVERY_MAX_ATTEMPTS: ${DELIVERY_MAX_ATTEMPTS:-8}
+      ENDPOINT_AUTO_DISABLE_AFTER: ${ENDPOINT_AUTO_DISABLE_AFTER:-100}
     depends_on:
       migrate:
         condition: service_completed_successfully

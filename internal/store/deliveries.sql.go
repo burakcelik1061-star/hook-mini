@@ -36,7 +36,7 @@ SELECT e.tenant_id, $1, e.id
 FROM endpoints e
 WHERE e.tenant_id = $2 AND e.status = 'active'
 ON CONFLICT (event_id, endpoint_id) DO NOTHING
-RETURNING id, tenant_id, event_id, endpoint_id, status, attempt_count, next_attempt_at, locked_until, locked_by, last_status_code, last_error, completed_at, created_at, updated_at, lease_token
+RETURNING id, tenant_id, event_id, endpoint_id, status, attempt_count, next_attempt_at, locked_until, locked_by, last_status_code, last_error, completed_at, created_at, updated_at, lease_token, round_base
 `
 
 type CreateDeliveriesForEventParams struct {
@@ -76,6 +76,7 @@ func (q *Queries) CreateDeliveriesForEvent(ctx context.Context, arg CreateDelive
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.LeaseToken,
+			&i.RoundBase,
 		); err != nil {
 			return nil, err
 		}
@@ -130,7 +131,7 @@ func (q *Queries) CreateDeliveryAttempt(ctx context.Context, arg CreateDeliveryA
 }
 
 const getDelivery = `-- name: GetDelivery :one
-SELECT id, tenant_id, event_id, endpoint_id, status, attempt_count, next_attempt_at, locked_until, locked_by, last_status_code, last_error, completed_at, created_at, updated_at, lease_token FROM deliveries
+SELECT id, tenant_id, event_id, endpoint_id, status, attempt_count, next_attempt_at, locked_until, locked_by, last_status_code, last_error, completed_at, created_at, updated_at, lease_token, round_base FROM deliveries
 WHERE id = $1 AND tenant_id = $2
 `
 
@@ -158,37 +159,42 @@ func (q *Queries) GetDelivery(ctx context.Context, arg GetDeliveryParams) (Deliv
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.LeaseToken,
+		&i.RoundBase,
 	)
 	return i, err
 }
 
 const listDeliveries = `-- name: ListDeliveries :many
-SELECT id, tenant_id, event_id, endpoint_id, status, attempt_count, next_attempt_at, locked_until, locked_by, last_status_code, last_error, completed_at, created_at, updated_at, lease_token FROM deliveries
+SELECT id, tenant_id, event_id, endpoint_id, status, attempt_count, next_attempt_at, locked_until, locked_by, last_status_code, last_error, completed_at, created_at, updated_at, lease_token, round_base FROM deliveries
 WHERE tenant_id = $1
   AND ($2::uuid IS NULL OR endpoint_id = $2::uuid)
-  AND ($3::text IS NULL OR status = $3::text)
+  AND ($3::uuid IS NULL OR event_id = $3::uuid)
+  AND ($4::text IS NULL OR status = $4::text)
   AND (
-    $4::timestamptz IS NULL
-    OR (created_at, id) < ($4::timestamptz, $5::uuid)
+    $5::timestamptz IS NULL
+    OR (created_at, id) < ($5::timestamptz, $6::uuid)
   )
 ORDER BY created_at DESC, id DESC
-LIMIT $6
+LIMIT $7
 `
 
 type ListDeliveriesParams struct {
 	TenantID       uuid.UUID
 	EndpointID     *uuid.UUID
+	EventID        *uuid.UUID
 	Status         *string
 	AfterCreatedAt *time.Time
 	AfterID        *uuid.UUID
 	PageSize       int32
 }
 
-// Optional filters by endpoint and status, newest first, keyset-paginated.
+// Optional filters by endpoint, event and status, newest first,
+// keyset-paginated.
 func (q *Queries) ListDeliveries(ctx context.Context, arg ListDeliveriesParams) ([]Delivery, error) {
 	rows, err := q.db.Query(ctx, listDeliveries,
 		arg.TenantID,
 		arg.EndpointID,
+		arg.EventID,
 		arg.Status,
 		arg.AfterCreatedAt,
 		arg.AfterID,
@@ -217,6 +223,7 @@ func (q *Queries) ListDeliveries(ctx context.Context, arg ListDeliveriesParams) 
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.LeaseToken,
+			&i.RoundBase,
 		); err != nil {
 			return nil, err
 		}
@@ -270,4 +277,47 @@ func (q *Queries) ListDeliveryAttempts(ctx context.Context, arg ListDeliveryAtte
 		return nil, err
 	}
 	return items, nil
+}
+
+const replayDelivery = `-- name: ReplayDelivery :one
+UPDATE deliveries
+SET status          = 'pending',
+    round_base      = attempt_count,
+    next_attempt_at = now(),
+    completed_at    = NULL
+WHERE id = $1 AND tenant_id = $2 AND status IN ('dead', 'succeeded')
+RETURNING id, tenant_id, event_id, endpoint_id, status, attempt_count, next_attempt_at, locked_until, locked_by, last_status_code, last_error, completed_at, created_at, updated_at, lease_token, round_base
+`
+
+type ReplayDeliveryParams struct {
+	ID       uuid.UUID
+	TenantID uuid.UUID
+}
+
+// Sends a finished delivery again. Only dead or succeeded deliveries qualify;
+// the status guard is what makes two simultaneous replays safe (the second
+// finds the row pending and changes nothing). The retry budget starts over
+// (round_base), the attempt history is kept.
+func (q *Queries) ReplayDelivery(ctx context.Context, arg ReplayDeliveryParams) (Delivery, error) {
+	row := q.db.QueryRow(ctx, replayDelivery, arg.ID, arg.TenantID)
+	var i Delivery
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.EventID,
+		&i.EndpointID,
+		&i.Status,
+		&i.AttemptCount,
+		&i.NextAttemptAt,
+		&i.LockedUntil,
+		&i.LockedBy,
+		&i.LastStatusCode,
+		&i.LastError,
+		&i.CompletedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.LeaseToken,
+		&i.RoundBase,
+	)
+	return i, err
 }

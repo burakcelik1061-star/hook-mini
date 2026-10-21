@@ -68,6 +68,14 @@ SET previous_secret            = secret,
 WHERE id = sqlc.arg(id) AND tenant_id = sqlc.arg(tenant_id)
 RETURNING *;
 
+-- name: DisableEndpointForTenant :one
+-- The tenant-scoped, manual counterpart of DisableEndpoint. Returns no row
+-- when the endpoint is already disabled or does not exist for the tenant.
+UPDATE endpoints
+SET status = 'disabled', disabled_at = now(), disabled_reason = sqlc.arg(reason)::text
+WHERE id = sqlc.arg(id) AND tenant_id = sqlc.arg(tenant_id) AND status = 'active'
+RETURNING *;
+
 -- name: EnableEndpoint :one
 UPDATE endpoints
 SET status = 'active', disabled_at = NULL, disabled_reason = NULL, consecutive_failures = 0

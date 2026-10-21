@@ -23,10 +23,12 @@ SELECT * FROM deliveries
 WHERE id = $1 AND tenant_id = $2;
 
 -- name: ListDeliveries :many
--- Optional filters by endpoint and status, newest first, keyset-paginated.
+-- Optional filters by endpoint, event and status, newest first,
+-- keyset-paginated.
 SELECT * FROM deliveries
 WHERE tenant_id = @tenant_id
   AND (sqlc.narg('endpoint_id')::uuid IS NULL OR endpoint_id = sqlc.narg('endpoint_id')::uuid)
+  AND (sqlc.narg('event_id')::uuid IS NULL OR event_id = sqlc.narg('event_id')::uuid)
   AND (sqlc.narg('status')::text IS NULL OR status = sqlc.narg('status')::text)
   AND (
     sqlc.narg('after_created_at')::timestamptz IS NULL
@@ -34,6 +36,19 @@ WHERE tenant_id = @tenant_id
   )
 ORDER BY created_at DESC, id DESC
 LIMIT @page_size;
+
+-- name: ReplayDelivery :one
+-- Sends a finished delivery again. Only dead or succeeded deliveries qualify;
+-- the status guard is what makes two simultaneous replays safe (the second
+-- finds the row pending and changes nothing). The retry budget starts over
+-- (round_base), the attempt history is kept.
+UPDATE deliveries
+SET status          = 'pending',
+    round_base      = attempt_count,
+    next_attempt_at = now(),
+    completed_at    = NULL
+WHERE id = $1 AND tenant_id = $2 AND status IN ('dead', 'succeeded')
+RETURNING *;
 
 -- name: CreateDeliveryAttempt :one
 INSERT INTO delivery_attempts (

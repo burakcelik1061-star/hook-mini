@@ -331,6 +331,12 @@ func TestConstraintsRejectBadData(t *testing.T) {
 		requireViolation(t, tx, "deliveries_completed_consistent", exec(ctx,
 			`UPDATE deliveries SET status = 'dead' WHERE id = $1`, d.ID))
 	})
+	t.Run("round_base stays within attempt_count", func(t *testing.T) {
+		requireViolation(t, tx, "deliveries_round_base_check", exec(ctx,
+			`UPDATE deliveries SET round_base = 1 WHERE id = $1`, d.ID)) // attempt_count is 0
+		requireViolation(t, tx, "deliveries_round_base_check", exec(ctx,
+			`UPDATE deliveries SET round_base = -1 WHERE id = $1`, d.ID))
+	})
 	t.Run("negative attempt count", func(t *testing.T) {
 		requireViolation(t, tx, "deliveries_attempt_count_check", exec(ctx,
 			`UPDATE deliveries SET attempt_count = -1 WHERE id = $1`, d.ID))
@@ -406,6 +412,40 @@ func TestSecretsNeverSerialize(t *testing.T) {
 	// The visible fields must still be there, or the test proves nothing.
 	if !strings.Contains(string(epJSON), ep.Url) || !strings.Contains(string(keyJSON), key.Prefix) {
 		t.Errorf("expected public fields missing: %s / %s", epJSON, keyJSON)
+	}
+}
+
+// The service checks ownership before replaying, but the query must hold on
+// its own: it is the last line of defence if that check is ever skipped or
+// races with a deletion.
+func TestReplayQueryIsTenantScopedAndStatusGuarded(t *testing.T) {
+	ctx, tx, q := begin(t)
+	tn, _, _, d := newDelivery(t, ctx, q)
+	stranger := newTenant(t, ctx, q)
+
+	finish := func(status string) {
+		t.Helper()
+		if _, err := tx.Exec(ctx, `UPDATE deliveries SET status = $2, attempt_count = 4, completed_at = now() WHERE id = $1`, d.ID, status); err != nil {
+			t.Fatal(err)
+		}
+	}
+	finish("dead")
+
+	if _, err := q.ReplayDelivery(ctx, store.ReplayDeliveryParams{ID: d.ID, TenantID: stranger.ID}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("replay by another tenant: err = %v, want ErrNoRows", err)
+	}
+	var status string
+	if err := tx.QueryRow(ctx, `SELECT status FROM deliveries WHERE id = $1`, d.ID).Scan(&status); err != nil || status != "dead" {
+		t.Fatalf("another tenant's replay changed the delivery: %s (%v)", status, err)
+	}
+
+	got, err := q.ReplayDelivery(ctx, store.ReplayDeliveryParams{ID: d.ID, TenantID: tn.ID})
+	if err != nil || got.Status != "pending" || got.RoundBase != 4 || got.AttemptCount != 4 || got.CompletedAt != nil {
+		t.Fatalf("replay by the owner: %+v err=%v", got, err)
+	}
+	// Already pending: the guard refuses a second replay.
+	if _, err := q.ReplayDelivery(ctx, store.ReplayDeliveryParams{ID: d.ID, TenantID: tn.ID}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("replay of a pending delivery: err = %v, want ErrNoRows", err)
 	}
 }
 

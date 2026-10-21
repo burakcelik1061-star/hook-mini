@@ -75,6 +75,7 @@ func TestWorkerDefaults(t *testing.T) {
 		Concurrency: 10, BatchSize: 10, PollInterval: 500 * time.Millisecond,
 		LeaseDuration: 60 * time.Second, RequestTimeout: 15 * time.Second,
 		MaxAttempts: 8, BackoffInitial: 30 * time.Second, BackoffMax: 6 * time.Hour,
+		AutoDisableAfter: 100,
 	}
 	if cfg.Worker != want {
 		t.Errorf("worker defaults = %+v, want %+v", cfg.Worker, want)
@@ -113,6 +114,7 @@ func TestWorkerValidation(t *testing.T) {
 		"concurrency not a number": {map[string]string{"WORKER_CONCURRENCY": "lots"}, "WORKER_CONCURRENCY must be an integer"},
 		"concurrency zero":         {map[string]string{"WORKER_CONCURRENCY": "0"}, "WORKER_CONCURRENCY must be between"},
 		"attempts too many":        {map[string]string{"DELIVERY_MAX_ATTEMPTS": "500"}, "DELIVERY_MAX_ATTEMPTS must be between"},
+		"auto-disable negative":    {map[string]string{"ENDPOINT_AUTO_DISABLE_AFTER": "-1"}, "ENDPOINT_AUTO_DISABLE_AFTER must be between"},
 		"poll too fast":            {map[string]string{"WORKER_POLL_INTERVAL": "1ms"}, "WORKER_POLL_INTERVAL must be between"},
 		"timeout unparsable":       {map[string]string{"DELIVERY_TIMEOUT": "soon"}, "DELIVERY_TIMEOUT"},
 		"lease shorter than request": {

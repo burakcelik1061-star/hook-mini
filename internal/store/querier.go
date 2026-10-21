@@ -61,6 +61,9 @@ type Querier interface {
 	DeleteTenant(ctx context.Context, id uuid.UUID) (int64, error)
 	// Idempotent: only an active endpoint is changed, so the first reason sticks.
 	DisableEndpoint(ctx context.Context, arg DisableEndpointParams) (int64, error)
+	// The tenant-scoped, manual counterpart of DisableEndpoint. Returns no row
+	// when the endpoint is already disabled or does not exist for the tenant.
+	DisableEndpointForTenant(ctx context.Context, arg DisableEndpointForTenantParams) (Endpoint, error)
 	EnableEndpoint(ctx context.Context, arg EnableEndpointParams) (Endpoint, error)
 	// Authentication path: look the key up by its public prefix, then the caller
 	// compares key_hash in constant time. Revoked keys are never returned.
@@ -79,7 +82,8 @@ type Querier interface {
 	ListAPIKeys(ctx context.Context, tenantID uuid.UUID) ([]ListAPIKeysRow, error)
 	// Fan-out target list. Served by endpoints_active_idx.
 	ListActiveEndpointIDs(ctx context.Context, tenantID uuid.UUID) ([]uuid.UUID, error)
-	// Optional filters by endpoint and status, newest first, keyset-paginated.
+	// Optional filters by endpoint, event and status, newest first,
+	// keyset-paginated.
 	ListDeliveries(ctx context.Context, arg ListDeliveriesParams) ([]Delivery, error)
 	// Joined to deliveries so the tenant check cannot be forgotten.
 	ListDeliveryAttempts(ctx context.Context, arg ListDeliveryAttemptsParams) ([]DeliveryAttempt, error)
@@ -108,6 +112,11 @@ type Querier interface {
 	RecordEndpointSuccess(ctx context.Context, id uuid.UUID) error
 	// One attempt row per reclaimed delivery, numbered with its new attempt_count.
 	RecordLostAttempts(ctx context.Context, arg RecordLostAttemptsParams) error
+	// Sends a finished delivery again. Only dead or succeeded deliveries qualify;
+	// the status guard is what makes two simultaneous replays safe (the second
+	// finds the row pending and changes nothing). The retry budget starts over
+	// (round_base), the attempt history is kept.
+	ReplayDelivery(ctx context.Context, arg ReplayDeliveryParams) (Delivery, error)
 	// Returns no row if the key does not exist for this tenant or is already revoked.
 	RevokeAPIKey(ctx context.Context, arg RevokeAPIKeyParams) (uuid.UUID, error)
 	// The current secret becomes the previous one, valid for grace_ms more; a

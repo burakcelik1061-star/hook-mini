@@ -72,6 +72,51 @@ func newEventResponse(e store.Event, deliveries *int) eventResponse {
 	}
 }
 
+type deliveryResponse struct {
+	ID         uuid.UUID `json:"id"`
+	EventID    uuid.UUID `json:"event_id"`
+	EndpointID uuid.UUID `json:"endpoint_id"`
+	// Status is pending (waiting for its first attempt or a retry), in_flight,
+	// succeeded or dead (gave up, or its endpoint was disabled).
+	Status       string `json:"status"`
+	AttemptCount int32  `json:"attempt_count"`
+	// NextAttemptAt is set only while the delivery is pending.
+	NextAttemptAt  *time.Time `json:"next_attempt_at,omitempty"`
+	LastStatusCode *int32     `json:"last_status_code,omitempty"`
+	LastError      *string    `json:"last_error,omitempty"`
+	CompletedAt    *time.Time `json:"completed_at,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	// Attempts is present on a single delivery, never in lists.
+	Attempts []attemptResponse `json:"attempts,omitempty"`
+}
+
+type attemptResponse struct {
+	AttemptNo       int32     `json:"attempt_no"`
+	StartedAt       time.Time `json:"started_at"`
+	DurationMs      int32     `json:"duration_ms"`
+	StatusCode      *int32    `json:"status_code,omitempty"`
+	ResponseSnippet *string   `json:"response_snippet,omitempty"`
+	Error           *string   `json:"error,omitempty"`
+}
+
+func newDeliveryResponse(d store.Delivery, attempts []store.DeliveryAttempt) deliveryResponse {
+	r := deliveryResponse{
+		ID: d.ID, EventID: d.EventID, EndpointID: d.EndpointID, Status: d.Status,
+		AttemptCount: d.AttemptCount, LastStatusCode: d.LastStatusCode, LastError: d.LastError,
+		CompletedAt: d.CompletedAt, CreatedAt: d.CreatedAt,
+	}
+	if d.Status == "pending" {
+		r.NextAttemptAt = &d.NextAttemptAt
+	}
+	for _, a := range attempts {
+		r.Attempts = append(r.Attempts, attemptResponse{
+			AttemptNo: a.AttemptNo, StartedAt: a.StartedAt, DurationMs: a.DurationMs,
+			StatusCode: a.StatusCode, ResponseSnippet: a.ResponseSnippet, Error: a.Error,
+		})
+	}
+	return r
+}
+
 type listResponse[T any] struct {
 	Data []T `json:"data"`
 	// NextCursor is null on the last page.
@@ -221,6 +266,109 @@ func (h *handlers) deleteEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *handlers) disableEndpoint(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	ep, err := h.svc.DisableEndpoint(r.Context(), principalFrom(r.Context()).TenantID, id)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, newEndpointResponse(ep, false))
+}
+
+func (h *handlers) enableEndpoint(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	ep, err := h.svc.EnableEndpoint(r.Context(), principalFrom(r.Context()).TenantID, id)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, newEndpointResponse(ep, false))
+}
+
+// ---- deliveries ----
+
+// optionalUUID reads a UUID query parameter. A malformed value is an error
+// (unlike a path id, it is something the caller typed into a filter).
+func optionalUUID(r *http.Request, name string) (*uuid.UUID, error) {
+	s := r.URL.Query().Get(name)
+	if s == "" {
+		return nil, nil
+	}
+	id, err := uuid.Parse(s)
+	if err != nil {
+		return nil, badRequest(name, "must be a UUID")
+	}
+	return &id, nil
+}
+
+func (h *handlers) listDeliveries(w http.ResponseWriter, r *http.Request) {
+	page, err := pageFrom(r)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	var f service.DeliveryFilter
+	if f.EndpointID, err = optionalUUID(r, "endpoint_id"); err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	if f.EventID, err = optionalUUID(r, "event_id"); err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	f.Status = r.URL.Query().Get("status")
+
+	res, err := h.svc.ListDeliveries(r.Context(), principalFrom(r.Context()).TenantID, f, page)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	items := make([]deliveryResponse, 0, len(res.Items))
+	for _, d := range res.Items {
+		items = append(items, newDeliveryResponse(d, nil))
+	}
+	writeJSON(w, http.StatusOK, newListResponse(items, res.NextCursor))
+}
+
+func (h *handlers) getDelivery(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	res, err := h.svc.GetDelivery(r.Context(), principalFrom(r.Context()).TenantID, id)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, newDeliveryResponse(res.Delivery, res.Attempts))
+}
+
+// replayDelivery queues a finished delivery to be sent again. It answers 202:
+// the delivery is accepted and will be attempted by a worker shortly.
+func (h *handlers) replayDelivery(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	d, err := h.svc.ReplayDelivery(r.Context(), principalFrom(r.Context()).TenantID, id)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, newDeliveryResponse(d, nil))
 }
 
 // ---- events ----

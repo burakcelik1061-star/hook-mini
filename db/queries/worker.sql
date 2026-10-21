@@ -47,6 +47,7 @@ RETURNING d.id,
           d.event_id,
           d.endpoint_id,
           d.attempt_count,
+          d.round_base,
           d.lease_token::uuid AS lease_token,
           e.type              AS event_type,
           e.payload           AS event_payload,
@@ -120,8 +121,8 @@ WITH expired AS MATERIALIZED (
 )
 UPDATE deliveries d
 SET attempt_count    = d.attempt_count + 1,
-    status           = CASE WHEN d.attempt_count + 1 >= sqlc.arg(max_attempts)::int THEN 'dead' ELSE 'pending' END,
-    completed_at     = CASE WHEN d.attempt_count + 1 >= sqlc.arg(max_attempts)::int THEN now() END,
+    status           = CASE WHEN d.attempt_count + 1 - d.round_base >= sqlc.arg(max_attempts)::int THEN 'dead' ELSE 'pending' END,
+    completed_at     = CASE WHEN d.attempt_count + 1 - d.round_base >= sqlc.arg(max_attempts)::int THEN now() END,
     next_attempt_at  = now(),
     locked_until     = NULL,
     locked_by        = NULL,

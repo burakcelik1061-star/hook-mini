@@ -4,10 +4,11 @@ A small webhook delivery service: applications send events, Hook Mini delivers
 them to subscriber endpoints with signed requests, retries and a delivery
 history. Think Svix, scaled down to something you can read in an afternoon.
 
-> **Status: Phase 4 (security).** Events are delivered by workers with retries
-> and dead-lettering, every request is signed in the
-> [Standard Webhooks](https://www.standardwebhooks.com) format, and private,
-> loopback and cloud-metadata destinations are refused at connect time. See
+> **Status: Phase 5 (operations).** Events are delivered by workers with
+> retries and dead-lettering, every request is signed in the
+> [Standard Webhooks](https://www.standardwebhooks.com) format, private
+> destinations are refused at connect time, and you can inspect every attempt,
+> replay deliveries and let failing endpoints switch themselves off. See
 > [Roadmap](#roadmap).
 
 ## Architecture
@@ -79,6 +80,8 @@ stateDiagram-v2
     in_flight --> pending: lease expired, attempts left (reaper)
     in_flight --> dead: lease expired on the last attempt
     in_flight --> dead: endpoint disabled (no request)
+    dead --> pending: replay
+    succeeded --> pending: replay
 ```
 
 Each attempt is a `POST` with this body and headers:
@@ -118,6 +121,22 @@ a wait, never shorten it. All times come from the database clock.
 | `DELIVERY_TIMEOUT` | `15s` | one attempt, reading the response included |
 | `DELIVERY_MAX_ATTEMPTS` | `8` | |
 | `DELIVERY_BACKOFF_INITIAL` / `_MAX` | `30s` / `6h` | |
+| `ENDPOINT_AUTO_DISABLE_AFTER` | `100` | consecutive failed attempts before an endpoint is disabled; `0` = never |
+
+### Failing endpoints and replay
+
+- **Inspect.** `GET /v1/deliveries?status=dead&endpoint_id=...` lists what
+  failed; `GET /v1/deliveries/{id}` shows every attempt (status code, duration,
+  the start of the response body, the error).
+- **Replay.** `POST /v1/deliveries/{id}/replay` sends a `dead` or `succeeded`
+  delivery again with a fresh retry budget. The attempt history is kept and
+  keeps counting up (a `round_base` column tracks the budget per round). Two
+  simultaneous replays queue it once; the second gets `409`.
+- **Auto-disable.** After `ENDPOINT_AUTO_DISABLE_AFTER` failed attempts in a
+  row (any success resets the count) the worker disables the endpoint. Its
+  pending deliveries end as `dead` with the reason, so nothing is lost: fix
+  the endpoint, `POST /v1/endpoints/{id}/enable`, and replay them. Replaying
+  to a disabled endpoint is refused with `409 endpoint_disabled`.
 
 ## Security
 
@@ -239,6 +258,10 @@ All `/v1` routes need `Authorization: Bearer <api key>`. Bodies are JSON.
 | `PATCH /v1/endpoints/{id}` | Change `url` and/or `description`. |
 | `POST /v1/endpoints/{id}/rotate-secret` | New signing secret (returned once); the old one keeps signing for 24h. |
 | `DELETE /v1/endpoints/{id}` | Delete an endpoint and its delivery history. `204`. |
+| `POST /v1/endpoints/{id}/disable` / `enable` | Stop or resume deliveries to an endpoint (`enable` resets its failure count). |
+| `GET /v1/deliveries` | List deliveries; filter by `endpoint_id`, `event_id`, `status`. |
+| `GET /v1/deliveries/{id}` | One delivery with all its attempts. |
+| `POST /v1/deliveries/{id}/replay` | Send a dead or succeeded delivery again. `202`. |
 | `POST /v1/events` | Submit an event. `201` when new, `200` on an idempotent replay. |
 | `GET /v1/events` | List events (newest first, paginated). |
 | `GET /v1/events/{id}` | One event with its `delivery_count`. |
@@ -263,6 +286,7 @@ from `next_cursor`, which is `null` on the last page).
 | 400 | `invalid_request` (with `field`) |
 | 401 | `unauthorized` |
 | 404 | `not_found` (also for another tenant's id) |
+| 409 | `delivery_not_replayable`, `endpoint_disabled` |
 | 405 | `method_not_allowed` |
 | 413 | `payload_too_large` (endpoints 16 KiB, events 256 KiB) |
 | 415 | `unsupported_media_type` |
@@ -335,8 +359,8 @@ go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate
 | 1 | Data model and generated queries |
 | 2 | API keys, endpoints, event ingestion with idempotency |
 | 3 | Queue, worker, retries with backoff and jitter, dead letters |
-| 4 | Request signing and SSRF protection (this) |
-| 5 | Delivery history, manual replay, auto-disable of failing endpoints |
+| 4 | Request signing and SSRF protection |
+| 5 | Delivery history, manual replay, auto-disable of failing endpoints (this) |
 | 6 | Integration and race tests |
 | 7 | OpenAPI, documentation polish |
 

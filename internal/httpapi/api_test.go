@@ -302,6 +302,156 @@ func TestEndpointLifecycleOverHTTP(t *testing.T) {
 	}
 }
 
+// forceStatus puts a delivery in a given state (no worker runs in these tests).
+func forceStatus(t *testing.T, id, status string) {
+	t.Helper()
+	q := map[string]string{
+		"dead":      `UPDATE deliveries SET status = 'dead', attempt_count = 2, completed_at = now(), last_status_code = 503, last_error = 'endpoint responded with HTTP 503' WHERE id = $1`,
+		"succeeded": `UPDATE deliveries SET status = 'succeeded', attempt_count = 1, completed_at = now(), last_status_code = 200 WHERE id = $1`,
+	}[status]
+	if _, err := testPool.Exec(context.Background(), q, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeliveryHistoryAndReplayOverHTTP(t *testing.T) {
+	srv, svc := newServer(t)
+	a, b := newTenantClient(t, srv, svc), newTenantClient(t, srv, svc)
+	ep := a.createEndpoint("https://example.invalid/history")
+	epID := ep["id"].(string)
+	ev := a.send("POST", "/v1/events", map[string]any{"type": "a.b", "payload": map[string]any{"n": 1}}).JSON()
+	evID := ev["id"].(string)
+
+	list := a.send("GET", "/v1/deliveries", nil)
+	items := list.JSON()["data"].([]any)
+	if list.StatusCode != 200 || len(items) != 1 {
+		t.Fatalf("list: %d %s", list.StatusCode, list.Body)
+	}
+	d := items[0].(map[string]any)
+	id := d["id"].(string)
+	if d["status"] != "pending" || d["endpoint_id"] != epID || d["event_id"] != evID || d["next_attempt_at"] == nil {
+		t.Errorf("a new delivery: %v", d)
+	}
+	if _, has := d["attempts"]; has {
+		t.Error("lists must not embed attempts")
+	}
+
+	// Detail carries the attempts; a pending delivery cannot be replayed.
+	if r := a.send("POST", "/v1/deliveries/"+id+"/replay", nil); r.StatusCode != 409 || r.errorCode() != "delivery_not_replayable" {
+		t.Errorf("replay of a pending delivery: %d %s", r.StatusCode, r.Body)
+	}
+
+	forceStatus(t, id, "dead")
+	if _, err := testPool.Exec(context.Background(), `INSERT INTO delivery_attempts (delivery_id, attempt_no, started_at, duration_ms, status_code, response_snippet, error)
+		VALUES ($1, 1, now(), 12, 503, 'try later', 'endpoint responded with HTTP 503'), ($1, 2, now(), 9, 503, NULL, 'endpoint responded with HTTP 503')`, id); err != nil {
+		t.Fatal(err)
+	}
+	detail := a.send("GET", "/v1/deliveries/"+id, nil).JSON()
+	atts, _ := detail["attempts"].([]any)
+	if detail["status"] != "dead" || len(atts) != 2 || detail["next_attempt_at"] != nil || detail["completed_at"] == nil {
+		t.Fatalf("detail: %v", detail)
+	}
+	if first := atts[0].(map[string]any); first["attempt_no"] != float64(1) || first["status_code"] != float64(503) || first["response_snippet"] != "try later" {
+		t.Errorf("first attempt: %v", first)
+	}
+
+	// Filters.
+	for name, tc := range map[string]struct {
+		query string
+		want  int
+	}{
+		"status dead":       {"?status=dead", 1},
+		"status pending":    {"?status=pending", 0},
+		"by endpoint":       {"?endpoint_id=" + epID, 1},
+		"by event":          {"?event_id=" + evID, 1},
+		"other endpoint id": {"?endpoint_id=" + uuid.NewString(), 0},
+		"combined":          {"?status=dead&endpoint_id=" + epID + "&event_id=" + evID, 1},
+	} {
+		res := a.send("GET", "/v1/deliveries"+tc.query, nil)
+		if got := len(res.JSON()["data"].([]any)); res.StatusCode != 200 || got != tc.want {
+			t.Errorf("%s: %d, %d items, want %d", name, res.StatusCode, got, tc.want)
+		}
+	}
+	for name, q := range map[string]string{"bad status": "?status=failed", "bad endpoint id": "?endpoint_id=nope", "bad event id": "?event_id=1"} {
+		if r := a.send("GET", "/v1/deliveries"+q, nil); r.StatusCode != 400 || r.errorCode() != "invalid_request" {
+			t.Errorf("%s: %d %s, want 400", name, r.StatusCode, r.Body)
+		}
+	}
+
+	// Replay: 202 and pending again; a second replay is refused.
+	r := a.send("POST", "/v1/deliveries/"+id+"/replay", nil)
+	if r.StatusCode != http.StatusAccepted || r.JSON()["status"] != "pending" || r.JSON()["attempt_count"] != float64(2) {
+		t.Fatalf("replay: %d %s", r.StatusCode, r.Body)
+	}
+	if r := a.send("POST", "/v1/deliveries/"+id+"/replay", nil); r.StatusCode != 409 || r.errorCode() != "delivery_not_replayable" {
+		t.Errorf("second replay: %d %s", r.StatusCode, r.Body)
+	}
+
+	// Isolation: another tenant sees and touches nothing.
+	if r := b.send("GET", "/v1/deliveries/"+id, nil); r.StatusCode != 404 {
+		t.Errorf("another tenant reads a delivery: %d", r.StatusCode)
+	}
+	forceStatus(t, id, "dead")
+	if r := b.send("POST", "/v1/deliveries/"+id+"/replay", nil); r.StatusCode != 404 {
+		t.Errorf("another tenant replays: %d", r.StatusCode)
+	}
+	if got := len(b.send("GET", "/v1/deliveries", nil).JSON()["data"].([]any)); got != 0 {
+		t.Errorf("another tenant lists %d deliveries", got)
+	}
+	if r := a.send("GET", "/v1/deliveries/not-a-uuid", nil); r.StatusCode != 404 {
+		t.Errorf("malformed id: %d, want 404", r.StatusCode)
+	}
+	if r := a.send("DELETE", "/v1/deliveries/"+id, nil); r.StatusCode != 405 {
+		t.Errorf("DELETE on a delivery: %d, want 405", r.StatusCode)
+	}
+}
+
+func TestDisableEnableAndReplayRulesOverHTTP(t *testing.T) {
+	srv, svc := newServer(t)
+	a, b := newTenantClient(t, srv, svc), newTenantClient(t, srv, svc)
+	epID := a.createEndpoint("https://example.invalid/toggle")["id"].(string)
+	a.send("POST", "/v1/events", map[string]any{"type": "a.b", "payload": map[string]any{}})
+	id := a.send("GET", "/v1/deliveries", nil).JSON()["data"].([]any)[0].(map[string]any)["id"].(string)
+	forceStatus(t, id, "dead")
+
+	off := a.send("POST", "/v1/endpoints/"+epID+"/disable", nil)
+	if off.StatusCode != 200 || off.JSON()["status"] != "disabled" || off.JSON()["disabled_reason"] != "disabled manually" || strings.Contains(string(off.Body), "whsec_") {
+		t.Fatalf("disable: %d %s", off.StatusCode, off.Body)
+	}
+	if r := a.send("POST", "/v1/endpoints/"+epID+"/disable", nil); r.StatusCode != 200 {
+		t.Errorf("disabling twice: %d, want 200 (idempotent)", r.StatusCode)
+	}
+
+	// A new event no longer fans out to it, and replay is refused with a
+	// reason that tells the caller what to do.
+	if n := a.send("POST", "/v1/events", map[string]any{"type": "a.b", "payload": map[string]any{}}).JSON()["delivery_count"]; n != float64(0) {
+		t.Errorf("delivery_count = %v for a disabled endpoint, want 0", n)
+	}
+	if r := a.send("POST", "/v1/deliveries/"+id+"/replay", nil); r.StatusCode != 409 || r.errorCode() != "endpoint_disabled" {
+		t.Errorf("replay to a disabled endpoint: %d %s", r.StatusCode, r.Body)
+	}
+
+	on := a.send("POST", "/v1/endpoints/"+epID+"/enable", nil)
+	if on.StatusCode != 200 || on.JSON()["status"] != "active" || on.JSON()["consecutive_failures"] != float64(0) || on.JSON()["disabled_at"] != nil {
+		t.Fatalf("enable: %d %s", on.StatusCode, on.Body)
+	}
+	if r := a.send("POST", "/v1/deliveries/"+id+"/replay", nil); r.StatusCode != http.StatusAccepted {
+		t.Errorf("replay after enabling: %d %s", r.StatusCode, r.Body)
+	}
+
+	for name, r := range map[string]response{
+		"disable": b.send("POST", "/v1/endpoints/"+epID+"/disable", nil),
+		"enable":  b.send("POST", "/v1/endpoints/"+epID+"/enable", nil),
+	} {
+		if r.StatusCode != 404 {
+			t.Errorf("%s by another tenant: %d, want 404", name, r.StatusCode)
+		}
+	}
+	if r := a.send("GET", "/v1/endpoints/"+epID+"/disable", nil); r.StatusCode != 405 {
+		t.Errorf("GET on disable: %d, want 405", r.StatusCode)
+	}
+}
+
 func TestSecretRotationOverHTTP(t *testing.T) {
 	srv, svc := newServer(t)
 	a, b := newTenantClient(t, srv, svc), newTenantClient(t, srv, svc)
