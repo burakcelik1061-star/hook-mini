@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/burakcelik1061-star/hook-mini/internal/database"
+	"github.com/burakcelik1061-star/hook-mini/internal/secretbox/secretboxtest"
 	"github.com/burakcelik1061-star/hook-mini/internal/service"
 )
 
@@ -65,7 +66,7 @@ func newServer(t *testing.T) (*httptest.Server, *service.Service) {
 	if testPool == nil {
 		t.Skip("TEST_DATABASE_URL not set")
 	}
-	svc := service.New(testPool, testLog)
+	svc := service.New(testPool, testLog, service.WithSecretKeys(secretboxtest.Keyring()))
 	srv := httptest.NewServer(NewRouter(Deps{Log: testLog, DB: testPool, Svc: svc}))
 	t.Cleanup(srv.Close)
 	return srv, svc

@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
+	"github.com/burakcelik1061-star/hook-mini/internal/secretbox"
 	"github.com/burakcelik1061-star/hook-mini/internal/store"
 )
 
@@ -23,6 +24,7 @@ type Service struct {
 	q      *store.Queries
 	log    *slog.Logger
 	egress safedial.Policy
+	keys   *secretbox.Keyring
 }
 
 // Option configures a Service.
@@ -33,6 +35,18 @@ type Option func(*Service)
 func WithEgressPolicy(p safedial.Policy) Option {
 	return func(s *Service) { s.egress = p }
 }
+
+// WithSecretKeys sets the keys that encrypt endpoint signing secrets in the
+// database. Without them, every operation that writes or reads a secret
+// fails: there is deliberately no fallback to storing plaintext.
+func WithSecretKeys(k *secretbox.Keyring) Option {
+	return func(s *Service) { s.keys = k }
+}
+
+// errNoKeys is returned by operations on secrets when the Service has no
+// keyring. It is a configuration error, so it is not exported as a client
+// error and becomes a 500.
+var errNoKeys = errors.New("service: no encryption keys configured for endpoint secrets")
 
 // New returns a Service backed by pool.
 func New(pool *pgxpool.Pool, log *slog.Logger, opts ...Option) *Service {

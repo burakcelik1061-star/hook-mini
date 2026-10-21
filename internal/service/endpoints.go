@@ -12,6 +12,7 @@ import (
 
 	"github.com/burakcelik1061-star/hook-mini/internal/credential"
 	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
+	"github.com/burakcelik1061-star/hook-mini/internal/secretbox"
 	"github.com/burakcelik1061-star/hook-mini/internal/store"
 )
 
@@ -42,9 +43,15 @@ func (s *Service) CreateEndpoint(ctx context.Context, tenantID uuid.UUID, in End
 	if err != nil {
 		return store.Endpoint{}, err
 	}
+	// The id is chosen here because the stored secret is sealed bound to it.
+	id := uuid.New()
+	sealed, err := s.seal(id, secret)
+	if err != nil {
+		return store.Endpoint{}, err
+	}
 
 	ep, err := s.q.CreateEndpoint(ctx, store.CreateEndpointParams{
-		TenantID: tenantID, Url: in.URL, Description: in.Description, Secret: secret,
+		ID: id, TenantID: tenantID, Url: in.URL, Description: in.Description, Secret: sealed,
 	})
 	if err != nil {
 		if ve := s.dataError(err, "body"); ve != nil {
@@ -52,7 +59,16 @@ func (s *Service) CreateEndpoint(ctx context.Context, tenantID uuid.UUID, in End
 		}
 		return store.Endpoint{}, fmt.Errorf("create endpoint: %w", err)
 	}
+	ep.Secret = secret // the caller gets the secret itself, once
 	return ep, nil
+}
+
+// seal encrypts an endpoint's signing secret for storage.
+func (s *Service) seal(endpointID uuid.UUID, secret string) (string, error) {
+	if s.keys == nil {
+		return "", errNoKeys
+	}
+	return s.keys.Seal(secret, secretbox.EndpointContext(endpointID))
 }
 
 // validateDestination checks the URL's syntax and then rejects destinations
@@ -87,8 +103,14 @@ func (s *Service) RotateEndpointSecret(ctx context.Context, tenantID, id uuid.UU
 	if err != nil {
 		return store.Endpoint{}, err
 	}
+	sealed, err := s.seal(id, secret)
+	if err != nil {
+		return store.Endpoint{}, err
+	}
+	// The sealed current secret moves to previous_secret as it is: both are
+	// bound to the endpoint, not to the column.
 	ep, err := s.q.RotateEndpointSecret(ctx, store.RotateEndpointSecretParams{
-		ID: id, TenantID: tenantID, NewSecret: secret, GraceMs: SecretRotationGrace.Milliseconds(),
+		ID: id, TenantID: tenantID, NewSecret: sealed, GraceMs: SecretRotationGrace.Milliseconds(),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return store.Endpoint{}, ErrNotFound
@@ -96,6 +118,7 @@ func (s *Service) RotateEndpointSecret(ctx context.Context, tenantID, id uuid.UU
 	if err != nil {
 		return store.Endpoint{}, fmt.Errorf("rotate secret: %w", err)
 	}
+	ep.Secret = secret // shown once, as at creation
 	return ep, nil
 }
 

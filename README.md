@@ -31,7 +31,12 @@ history. Think Svix, scaled down to something you can read in an afternoon.
 
 ## Quick start
 
-Requires Docker.
+Requires Docker. Endpoint signing secrets are stored encrypted, so first create
+the encryption key (once; keep it, and back it up like a database password):
+
+```bash
+echo "SECRET_ENCRYPTION_KEYS=$(openssl rand -base64 32)" > .env
+```
 
 ```bash
 docker compose up -d --build
@@ -320,6 +325,22 @@ specification's published example.
 (once). For 24 hours requests carry two signatures, one per secret, so the
 receiver can switch whenever it is ready without rejecting a delivery.
 
+### Signing secrets at rest
+
+Signing needs the raw secret, so it cannot be hashed like an API key; instead
+it is encrypted (`internal/secretbox`): AES-256-GCM with a fresh random nonce
+per value, under a key from `SECRET_ENCRYPTION_KEYS` that never touches the
+database. A stored secret looks like `enc:v1:<key id>:<ciphertext>`, and is
+bound to its endpoint's id: copied onto another endpoint, it does not decrypt.
+The api seals a secret before writing it and returns the plaintext only in the
+one response that creates it; the worker decrypts it just before signing. A
+value that does not decrypt (damaged, or tampered with) is never used: the
+delivery ends as `dead` with the reason, and no request goes out.
+
+`migrate` encrypts any plaintext secrets left from older versions, and the api
+and worker refuse to start if one remains, so a running service implies none
+is stored. See [Replacing the encryption key](#replacing-the-encryption-key).
+
 ### Destinations
 
 A tenant controls endpoint URLs, so without care the worker would send
@@ -373,6 +394,7 @@ reported together at startup. `.env.example` lists them.
 | `HTTP_ADDR` | `:8080` | api | listen address |
 | `LOG_LEVEL` / `LOG_FORMAT` | `info` / `json` | all | `json` for production, `text` for a terminal |
 | `SHUTDOWN_TIMEOUT` | `20s` | api, worker | how long to wait for work in flight on `SIGTERM`; must be ≥ `DELIVERY_TIMEOUT` + 5s |
+| `SECRET_ENCRYPTION_KEYS` | (required) | api, worker, migrate | base64 32-byte keys, comma-separated, the current one first; they encrypt the endpoint signing secrets at rest |
 | `ALLOW_PRIVATE_DESTINATIONS` | `false` | api, worker | **development only**: allow loopback/private targets |
 | `WORKER_ID` | generated | worker | name in leases and logs |
 | `WORKER_CONCURRENCY` | `10` | worker | attempts in flight per worker |
@@ -397,10 +419,26 @@ docker compose run --rm api admin revoke-key <tenant id> <key id>
 Without Docker for the Go parts (Go 1.27+, a Postgres you run yourself):
 
 ```bash
-cp .env.example .env   # then export its variables, or set them in your shell
+[ -f .env ] || cp .env.example .env   # never overwrite the file that holds your key
+# then export its variables (SECRET_ENCRYPTION_KEYS included), or set them in your shell
 go run ./cmd/migrate
 go run ./cmd/api
 ```
+
+### Replacing the encryption key
+
+Every stored secret carries the id of the key that sealed it, and several keys
+can be configured at once (the first one seals, all of them open), so the key
+can be replaced without downtime:
+
+1. Put the new key first: `SECRET_ENCRYPTION_KEYS=<new>,<old>`, and restart.
+2. Run `migrate` (`docker compose up -d migrate`): it re-encrypts every secret
+   with the new key. It is idempotent and safe while the api is serving.
+3. Remove the old key and restart.
+
+Removing a key too early is caught at startup: the api and the worker refuse
+to run while any secret is sealed with a key they do not have, or stored in
+plaintext, and say which and how many.
 
 Scale delivery by running more workers (`docker compose up -d --scale worker=3`).
 Stopping a worker (`SIGTERM`) is safe at any time; killing one (`SIGKILL`) is
@@ -478,8 +516,12 @@ Inputs that once failed are kept under `testdata/fuzz/` and rerun on every
 
 Chosen limits and gaps, so nothing here is a surprise:
 
-- **Signing secrets are stored in plain text** in the database: HMAC needs the
-  raw value. Encryption at rest (and a key-management story) is not done.
+- **The encryption key lives in the environment, not in a KMS.** Signing
+  secrets are encrypted at rest, which protects a leaked dump or backup; an
+  attacker with both the database and the processes' environment can still
+  read them. Losing the key makes every stored signing secret unrecoverable
+  (each endpoint would need `rotate-secret`). Upgrade api and worker
+  together: a worker from before encryption cannot read encrypted secrets.
 - **No rate limiting** on the API, and no per-tenant or per-endpoint fairness:
   one tenant sending a flood can occupy the queue.
 - **Idempotency keys expire with their events.** Finished data is deleted
@@ -519,6 +561,7 @@ tried and what the tests found.
 | [`docs/07-openapi.md`](docs/07-openapi.md) | The OpenAPI document and how it is kept honest |
 | [`docs/08-son-inceleme.md`](docs/08-son-inceleme.md) | Final security and concurrency review: 16 findings, what changed, what the chaos test taught |
 | [`docs/09-saklama-suresi.md`](docs/09-saklama-suresi.md) | Retention: what is deleted, what never is, how it stays safe |
+| [`docs/10-sir-sifreleme.md`](docs/10-sir-sifreleme.md) | Encrypting the signing secrets at rest: design, migration, key replacement |
 | [`api/openapi.yaml`](api/openapi.yaml) | The API contract |
 
 ## Roadmap

@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/burakcelik1061-star/hook-mini/internal/secretbox"
 )
 
 // Config is the validated configuration shared by the api, worker and migrate
@@ -38,6 +40,21 @@ type Config struct {
 	RetentionPeriod time.Duration
 	// CleanupInterval is how often the worker deletes what has expired.
 	CleanupInterval time.Duration
+	// SecretKeys encrypt the endpoint signing secrets stored in the
+	// database (SECRET_ENCRYPTION_KEYS). Nil when unset; the binaries that
+	// need them ask through RequireSecretKeys.
+	SecretKeys *secretbox.Keyring
+}
+
+// RequireSecretKeys returns the configured encryption keys, or an error
+// explaining how to set them. The api, the worker and migrate cannot run
+// without them; admin can.
+func (c Config) RequireSecretKeys() (*secretbox.Keyring, error) {
+	if c.SecretKeys == nil {
+		return nil, errors.New("SECRET_ENCRYPTION_KEYS is required: one or more base64-encoded 32-byte keys, " +
+			"separated by commas, the current one first (generate one with: openssl rand -base64 32)")
+	}
+	return c.SecretKeys, nil
 }
 
 // MinRetentionPeriod is the shortest retention period other than zero (off).
@@ -163,6 +180,15 @@ func Load(getenv func(string) string) (Config, error) {
 		fail("RETENTION_PERIOD (%s) must be 0 (keep forever) or at least %s", cfg.RetentionPeriod, MinRetentionPeriod)
 	}
 	cfg.CleanupInterval = duration("CLEANUP_INTERVAL", "1h", time.Minute, 24*time.Hour)
+
+	if v := get("SECRET_ENCRYPTION_KEYS", ""); v != "" {
+		k, err := secretbox.ParseKeys(v)
+		if err != nil {
+			fail("SECRET_ENCRYPTION_KEYS: %v", err) // the error never repeats a key
+		} else {
+			cfg.SecretKeys = k
+		}
+	}
 
 	if len(errs) > 0 {
 		return Config{}, fmt.Errorf("invalid configuration: %w", errors.Join(errs...))

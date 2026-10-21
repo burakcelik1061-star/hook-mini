@@ -14,12 +14,13 @@ import (
 
 const createEndpoint = `-- name: CreateEndpoint :one
 
-INSERT INTO endpoints (tenant_id, url, description, secret)
-VALUES ($1, $2, $3, $4)
+INSERT INTO endpoints (id, tenant_id, url, description, secret)
+VALUES ($1, $2, $3, $4, $5)
 RETURNING id, tenant_id, url, description, secret, status, consecutive_failures, disabled_at, disabled_reason, created_at, updated_at, previous_secret, previous_secret_expires_at
 `
 
 type CreateEndpointParams struct {
+	ID          uuid.UUID
 	TenantID    uuid.UUID
 	Url         string
 	Description string
@@ -28,8 +29,11 @@ type CreateEndpointParams struct {
 
 // Every query that takes an endpoint id from outside also takes the tenant id.
 // That is what stops one tenant from reading or changing another's endpoint.
+// The id is chosen by the caller: the secret is encrypted bound to it, so it
+// must be known before the row exists.
 func (q *Queries) CreateEndpoint(ctx context.Context, arg CreateEndpointParams) (Endpoint, error) {
 	row := q.db.QueryRow(ctx, createEndpoint,
+		arg.ID,
 		arg.TenantID,
 		arg.Url,
 		arg.Description,

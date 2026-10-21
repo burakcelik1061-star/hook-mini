@@ -13,6 +13,7 @@ import (
 	"github.com/burakcelik1061-star/hook-mini/internal/lifecycle"
 	"github.com/burakcelik1061-star/hook-mini/internal/logging"
 	"github.com/burakcelik1061-star/hook-mini/internal/retention"
+	"github.com/burakcelik1061-star/hook-mini/internal/service"
 )
 
 func main() {
@@ -27,6 +28,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	keys, err := cfg.RequireSecretKeys()
+	if err != nil {
+		return err
+	}
 	log := logging.New(os.Stdout, "worker", cfg.LogFormat, cfg.LogLevel)
 
 	ctx, stop := lifecycle.SignalContext()
@@ -37,6 +42,12 @@ func run() error {
 		return err
 	}
 	defer pool.Close()
+
+	// Every secret must open with the configured keys before any delivery is
+	// attempted (see service.CheckSecrets).
+	if err := service.New(pool, log, service.WithSecretKeys(keys)).CheckSecrets(ctx); err != nil {
+		return err
+	}
 
 	wc := cfg.Worker
 	w, err := delivery.NewWorker(pool, log, delivery.Config{
@@ -54,6 +65,7 @@ func run() error {
 		},
 		AutoDisableAfter:     wc.AutoDisableAfter,
 		AllowPrivateNetworks: cfg.AllowPrivateDestinations,
+		Keys:                 keys,
 	})
 	if err != nil {
 		return err

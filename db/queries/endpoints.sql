@@ -2,8 +2,10 @@
 -- That is what stops one tenant from reading or changing another's endpoint.
 
 -- name: CreateEndpoint :one
-INSERT INTO endpoints (tenant_id, url, description, secret)
-VALUES ($1, $2, $3, $4)
+-- The id is chosen by the caller: the secret is encrypted bound to it, so it
+-- must be known before the row exists.
+INSERT INTO endpoints (id, tenant_id, url, description, secret)
+VALUES ($1, $2, $3, $4, $5)
 RETURNING *;
 
 -- name: GetEndpoint :one

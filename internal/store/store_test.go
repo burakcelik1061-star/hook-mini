@@ -114,7 +114,7 @@ func newTenant(t *testing.T, ctx context.Context, q *store.Queries) store.Tenant
 func newEndpoint(t *testing.T, ctx context.Context, q *store.Queries, tenant uuid.UUID) store.Endpoint {
 	t.Helper()
 	ep, err := q.CreateEndpoint(ctx, store.CreateEndpointParams{
-		TenantID: tenant, Url: "https://example.invalid/hooks/" + uuid.NewString()[:8], Secret: secret,
+		ID: uuid.New(), TenantID: tenant, Url: "https://example.invalid/hooks/" + uuid.NewString()[:8], Secret: secret,
 	})
 	if err != nil {
 		t.Fatalf("CreateEndpoint: %v", err)

@@ -27,6 +27,7 @@ import (
 	"github.com/burakcelik1061-star/hook-mini/internal/database"
 	"github.com/burakcelik1061-star/hook-mini/internal/openapicheck"
 	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
+	"github.com/burakcelik1061-star/hook-mini/internal/secretbox/secretboxtest"
 	"github.com/burakcelik1061-star/hook-mini/internal/service"
 	"github.com/burakcelik1061-star/hook-mini/internal/store"
 	"github.com/burakcelik1061-star/hook-mini/pkg/webhook"
@@ -117,6 +118,7 @@ func testConfig(id string) Config {
 		Retry:          RetryPolicy{MaxAttempts: 3, InitialBackoff: 10 * time.Millisecond, MaxBackoff: 50 * time.Millisecond},
 		// The tests' endpoints are httptest servers on 127.0.0.1.
 		AllowPrivateNetworks: true,
+		Keys:                 secretboxtest.Keyring(),
 	}
 }
 
@@ -144,7 +146,7 @@ func newFixture(t *testing.T) *fixture {
 	})
 
 	// The service must accept 127.0.0.1 endpoint URLs for the test servers.
-	svc := service.New(testPool, log, service.WithEgressPolicy(safedial.Policy{AllowPrivate: true}))
+	svc := service.New(testPool, log, service.WithEgressPolicy(safedial.Policy{AllowPrivate: true}), service.WithSecretKeys(secretboxtest.Keyring()))
 	f := &fixture{t: t, ctx: context.Background(), svc: svc, q: store.New(testPool), log: log, logs: logs}
 	tn, err := f.svc.CreateTenant(f.ctx, "Delivery "+uuid.NewString()[:8])
 	if err != nil {
@@ -1166,6 +1168,42 @@ func TestDeliveredRequestsVerifyWithTheEndpointSecret(t *testing.T) {
 	}
 }
 
+// A stored secret that does not open (damaged, or copied from another
+// endpoint: sealed values are bound to their endpoint) is never used and
+// never guessed around: the delivery is abandoned with the reason, and no
+// request goes out. The startup check rules out a missing key, so only such a
+// value can get here.
+func TestUndecryptableSecretAbandonsTheDelivery(t *testing.T) {
+	f := newFixture(t)
+	srv, rec := newRecorder(t, nil)
+	victim := f.endpoint(srv.URL)
+	donor := f.endpoint(srv.URL + "/other")
+	if _, err := testPool.Exec(f.ctx, `UPDATE endpoints SET secret = (SELECT secret FROM endpoints WHERE id = $2) WHERE id = $1`, victim, donor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(f.ctx, `UPDATE endpoints SET status = 'disabled', disabled_at = now() WHERE id = $1`, donor); err != nil {
+		t.Fatal(err)
+	}
+	f.events(1)
+
+	f.start(testConfig("w-undecryptable"))
+	f.waitStatus(5*time.Second, "dead", 1) // the donor is disabled, so it got no delivery
+	var lastError string
+	if err := testPool.QueryRow(f.ctx, `SELECT last_error FROM deliveries WHERE endpoint_id = $1`, victim).Scan(&lastError); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(lastError, "cannot be decrypted") {
+		t.Errorf("last_error = %q, want the decryption failure", lastError)
+	}
+	if strings.Contains(lastError, "whsec_") || strings.Contains(lastError, "enc:v1") {
+		t.Errorf("last_error repeats key material: %q", lastError)
+	}
+	if n := rec.count(); n != 0 {
+		t.Errorf("%d requests went out with a secret that did not open", n)
+	}
+	f.assertInvariant()
+}
+
 func TestSecretRotationOverlapsThenEnds(t *testing.T) {
 	f := newFixture(t)
 	srv, rec := newRecorder(t, nil)
@@ -1289,6 +1327,7 @@ func TestNewWorkerRejectsBadConfig(t *testing.T) {
 		"lease shorter than req": func(c *Config) { c.LeaseDuration = c.RequestTimeout },
 		"no drain":               func(c *Config) { c.DrainTimeout = 0 },
 		"bad retry policy":       func(c *Config) { c.Retry.MaxAttempts = 0 },
+		"no encryption keys":     func(c *Config) { c.Keys = nil },
 	} {
 		c := ok
 		mutate(&c)
@@ -1299,6 +1338,7 @@ func TestNewWorkerRejectsBadConfig(t *testing.T) {
 	w, err := NewWorker(nil, slog.New(slog.NewTextHandler(io.Discard, nil)), Config{
 		Concurrency: 2, BatchSize: 50, PollInterval: time.Second, LeaseDuration: time.Minute,
 		RequestTimeout: time.Second, DrainTimeout: time.Second, Retry: DefaultRetryPolicy(),
+		Keys: secretboxtest.Keyring(),
 	})
 	if err != nil {
 		t.Fatal(err)

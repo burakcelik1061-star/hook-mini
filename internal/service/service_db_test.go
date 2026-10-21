@@ -20,6 +20,8 @@ import (
 
 	"github.com/burakcelik1061-star/hook-mini/internal/database"
 	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
+	"github.com/burakcelik1061-star/hook-mini/internal/secretbox"
+	"github.com/burakcelik1061-star/hook-mini/internal/secretbox/secretboxtest"
 	"github.com/burakcelik1061-star/hook-mini/internal/store"
 )
 
@@ -59,7 +61,17 @@ func newService(t testing.TB) *Service {
 	if testPool == nil {
 		t.Skip("TEST_DATABASE_URL not set")
 	}
-	return New(testPool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(testPool, slog.New(slog.NewTextHandler(io.Discard, nil)), WithSecretKeys(secretboxtest.Keyring()))
+}
+
+// open decrypts a secret as stored for the endpoint.
+func open(t *testing.T, endpointID uuid.UUID, stored string) string {
+	t.Helper()
+	plain, err := secretboxtest.Keyring().Open(stored, secretbox.EndpointContext(endpointID))
+	if err != nil {
+		t.Fatalf("the stored secret does not open: %v", err)
+	}
+	return plain
 }
 
 // newTenant creates a tenant that is removed when the test ends.
@@ -166,7 +178,7 @@ func TestEndpointLifecycleAndIsolation(t *testing.T) {
 	}
 
 	got, err := s.GetEndpoint(ctx(), a.ID, ep.ID)
-	if err != nil || got.ID != ep.ID || got.Secret != ep.Secret {
+	if err != nil || got.ID != ep.ID || open(t, ep.ID, got.Secret) != ep.Secret {
 		t.Fatalf("owner cannot read its endpoint: %v", err)
 	}
 
@@ -193,7 +205,7 @@ func TestEndpointLifecycleAndIsolation(t *testing.T) {
 	if err != nil || up.Description != "" || up.Url != "https://example.invalid/new" {
 		t.Fatalf("clearing the description: %+v err=%v", up, err)
 	}
-	if up.Secret != ep.Secret {
+	if open(t, ep.ID, up.Secret) != ep.Secret {
 		t.Error("an update must not change the signing secret")
 	}
 
@@ -231,7 +243,7 @@ func TestEndpointURLsPointingInsideAreRejected(t *testing.T) {
 	}
 
 	// Development setups can opt in.
-	dev := New(testPool, s.log, WithEgressPolicy(safedial.Policy{AllowPrivate: true}))
+	dev := New(testPool, s.log, WithEgressPolicy(safedial.Policy{AllowPrivate: true}), WithSecretKeys(secretboxtest.Keyring()))
 	if _, err := dev.CreateEndpoint(ctx(), tn.ID, EndpointInput{URL: "http://127.0.0.1:9000/hook"}); err != nil {
 		t.Errorf("with private destinations allowed: %v", err)
 	}
@@ -249,7 +261,7 @@ func TestRotateEndpointSecret(t *testing.T) {
 	if r1.Secret == ep.Secret || !strings.HasPrefix(r1.Secret, "whsec_") {
 		t.Errorf("new secret %q is not a fresh secret", r1.Secret)
 	}
-	if r1.PreviousSecret == nil || *r1.PreviousSecret != ep.Secret {
+	if r1.PreviousSecret == nil || open(t, ep.ID, *r1.PreviousSecret) != ep.Secret {
 		t.Error("the old secret was not kept as the previous one")
 	}
 	if r1.PreviousSecretExpiresAt == nil {
@@ -261,14 +273,14 @@ func TestRotateEndpointSecret(t *testing.T) {
 
 	// A second rotation keeps only the immediately previous secret.
 	r2, err := s.RotateEndpointSecret(ctx(), a.ID, ep.ID)
-	if err != nil || *r2.PreviousSecret != r1.Secret || r2.Secret == r1.Secret {
+	if err != nil || open(t, ep.ID, *r2.PreviousSecret) != r1.Secret || r2.Secret == r1.Secret {
 		t.Errorf("second rotation: previous=%v err=%v", r2.PreviousSecret, err)
 	}
 
 	if _, err := s.RotateEndpointSecret(ctx(), b.ID, ep.ID); !errors.Is(err, ErrNotFound) {
 		t.Errorf("rotation by another tenant: %v, want ErrNotFound", err)
 	}
-	if got, _ := s.GetEndpoint(ctx(), a.ID, ep.ID); got.Secret != r2.Secret {
+	if got, _ := s.GetEndpoint(ctx(), a.ID, ep.ID); open(t, ep.ID, got.Secret) != r2.Secret {
 		t.Error("the other tenant's attempt changed the secret")
 	}
 }

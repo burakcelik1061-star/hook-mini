@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
+	"github.com/burakcelik1061-star/hook-mini/internal/secretbox"
 	"github.com/burakcelik1061-star/hook-mini/internal/store"
 )
 
@@ -73,6 +74,9 @@ type Config struct {
 	// Transport sends the HTTP requests. Nil means a transport that enforces
 	// the destination policy at dial time; set it only in tests.
 	Transport http.RoundTripper
+	// Keys open the endpoint signing secrets, which the database stores
+	// encrypted. Required.
+	Keys *secretbox.Keyring
 }
 
 // DefaultConfig returns production defaults.
@@ -106,6 +110,8 @@ func (c Config) validate() error {
 		return errors.New("auto-disable threshold must not be negative")
 	case c.DrainTimeout <= 0:
 		return errors.New("drain timeout must be positive")
+	case c.Keys == nil:
+		return errors.New("encryption keys for the endpoint secrets are required")
 	}
 	if err := c.Retry.Validate(); err != nil {
 		return fmt.Errorf("retry policy: %w", err)
@@ -273,9 +279,12 @@ func (w *Worker) process(ctx context.Context, job store.ClaimDueDeliveriesRow) {
 		return
 	}
 
-	secrets := []string{job.EndpointSecret}
-	if job.PreviousSecretValid && job.EndpointPreviousSecret != nil {
-		secrets = append(secrets, *job.EndpointPreviousSecret)
+	secrets, err := w.openSecrets(job)
+	if err != nil {
+		// The startup check guarantees every key is configured, so this is a
+		// damaged or tampered value; the error names neither key nor secret.
+		w.abandon(log, job, "the endpoint's signing secret cannot be decrypted: "+err.Error())
+		return
 	}
 	msg, err := newMessage(job.EndpointUrl, job.EventID, job.EventType, job.EventCreatedAt, job.EventPayload, secrets...)
 	if err != nil {
@@ -285,6 +294,25 @@ func (w *Worker) process(ctx context.Context, job store.ClaimDueDeliveriesRow) {
 		return
 	}
 	w.record(log, job, w.http.send(ctx, msg))
+}
+
+// openSecrets decrypts the secrets to sign with: the current one, and the
+// previous one while its grace period lasts.
+func (w *Worker) openSecrets(job store.ClaimDueDeliveriesRow) ([]string, error) {
+	ctx := secretbox.EndpointContext(job.EndpointID)
+	current, err := w.cfg.Keys.Open(job.EndpointSecret, ctx)
+	if err != nil {
+		return nil, err
+	}
+	secrets := []string{current}
+	if job.PreviousSecretValid && job.EndpointPreviousSecret != nil {
+		previous, err := w.cfg.Keys.Open(*job.EndpointPreviousSecret, ctx)
+		if err != nil {
+			return nil, err
+		}
+		secrets = append(secrets, previous)
+	}
+	return secrets, nil
 }
 
 // record writes the outcome of an attempt: the delivery's new state, the

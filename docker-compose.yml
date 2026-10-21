@@ -29,6 +29,12 @@ services:
       # receiver lives on the Docker network (a private address), so the demo
       # turns this on: ALLOW_PRIVATE_DESTINATIONS=true docker compose --profile demo up -d
       ALLOW_PRIVATE_DESTINATIONS: ${ALLOW_PRIVATE_DESTINATIONS:-false}
+      # Encrypts the endpoint signing secrets stored in the database. Required,
+      # with no default on purpose; put it in a .env file next to this one:
+      #   echo "SECRET_ENCRYPTION_KEYS=$(openssl rand -base64 32)" > .env
+      # Left empty, migrate refuses to run (and api and worker wait for it),
+      # while commands that need only postgres keep working.
+      SECRET_ENCRYPTION_KEYS: ${SECRET_ENCRYPTION_KEYS:-}
     depends_on:
       postgres:
         condition: service_healthy

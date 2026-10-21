@@ -29,6 +29,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	keys, err := cfg.RequireSecretKeys()
+	if err != nil {
+		return err
+	}
 	log := logging.New(os.Stdout, "api", cfg.LogFormat, cfg.LogLevel)
 
 	ctx, stop := lifecycle.SignalContext()
@@ -43,7 +47,14 @@ func run() error {
 	if cfg.AllowPrivateDestinations {
 		log.Warn("ALLOW_PRIVATE_DESTINATIONS is on: endpoints may point at private and loopback addresses; never use this in production")
 	}
-	svc := service.New(pool, log, service.WithEgressPolicy(safedial.Policy{AllowPrivate: cfg.AllowPrivateDestinations}))
+	svc := service.New(pool, log,
+		service.WithEgressPolicy(safedial.Policy{AllowPrivate: cfg.AllowPrivateDestinations}),
+		service.WithSecretKeys(keys))
+	// Refuse to serve while any signing secret is stored in plaintext or
+	// sealed with a key that is not configured.
+	if err := svc.CheckSecrets(ctx); err != nil {
+		return err
+	}
 
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {

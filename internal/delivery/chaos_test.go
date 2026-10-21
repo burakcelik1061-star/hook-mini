@@ -17,6 +17,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/burakcelik1061-star/hook-mini/internal/secretbox"
+	"github.com/burakcelik1061-star/hook-mini/internal/secretbox/secretboxtest"
 	"github.com/burakcelik1061-star/hook-mini/internal/service"
 	"github.com/burakcelik1061-star/hook-mini/pkg/webhook"
 )
@@ -67,14 +69,22 @@ func TestChaos(t *testing.T) {
 		// Verify the signature with the secrets the endpoint has right now
 		// (current and previous), exactly as a real receiver with both would.
 		sigOK, known := false, false
+		var id uuid.UUID
 		var secret string
 		var previous *string
 		if err := testPool.QueryRow(context.Background(),
-			`SELECT secret, previous_secret FROM endpoints WHERE url = $1`, srv.URL+r.URL.Path).Scan(&secret, &previous); err == nil {
+			`SELECT id, secret, previous_secret FROM endpoints WHERE url = $1`, srv.URL+r.URL.Path).Scan(&id, &secret, &previous); err == nil {
 			known = true
-			secrets := []string{secret}
-			if previous != nil {
-				secrets = append(secrets, *previous)
+			// Stored encrypted, like a receiver's copy would not be: open them.
+			keys, ctx := secretboxtest.Keyring(), secretbox.EndpointContext(id)
+			var secrets []string
+			for _, s := range append([]*string{&secret}, previous) {
+				if s == nil {
+					continue
+				}
+				if plain, err := keys.Open(*s, ctx); err == nil {
+					secrets = append(secrets, plain)
+				}
 			}
 			if v, err := webhook.NewVerifier(secrets...); err == nil {
 				sigOK = v.Verify(r.Header, body) == nil

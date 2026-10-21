@@ -37,6 +37,10 @@ type Querier interface {
 	// materialized CTE runs exactly once (see TestClaimLocksOnce).
 	ClaimDueDeliveries(ctx context.Context, arg ClaimDueDeliveriesParams) ([]ClaimDueDeliveriesRow, error)
 	CountDeliveriesForEvent(ctx context.Context, arg CountDeliveriesForEventParams) (int64, error)
+	// How many stored secrets each key sealed; key_id is '' for a value that is
+	// not sealed at all (plaintext). Used at startup to refuse to run with
+	// plaintext secrets in the database or without a key that sealed some.
+	CountEndpointSecretsByKey(ctx context.Context) ([]CountEndpointSecretsByKeyRow, error)
 	CreateAPIKey(ctx context.Context, arg CreateAPIKeyParams) (ApiKey, error)
 	// Phase 1 covers creating and reading deliveries. The worker's queries (claim
 	// with FOR UPDATE SKIP LOCKED, complete, schedule a retry, mark dead, reclaim
@@ -57,6 +61,8 @@ type Querier interface {
 	CreateDeliveryAttempt(ctx context.Context, arg CreateDeliveryAttemptParams) (DeliveryAttempt, error)
 	// Every query that takes an endpoint id from outside also takes the tenant id.
 	// That is what stops one tenant from reading or changing another's endpoint.
+	// The id is chosen by the caller: the secret is encrypted bound to it, so it
+	// must be known before the row exists.
 	CreateEndpoint(ctx context.Context, arg CreateEndpointParams) (Endpoint, error)
 	// Idempotent insert. When (tenant_id, idempotency_key) already exists nothing
 	// is inserted and no row comes back (sql.ErrNoRows / pgx.ErrNoRows); the caller
@@ -112,6 +118,11 @@ type Querier interface {
 	ListDeliveries(ctx context.Context, arg ListDeliveriesParams) ([]Delivery, error)
 	// Joined to deliveries so the tenant check cannot be forgotten.
 	ListDeliveryAttempts(ctx context.Context, arg ListDeliveryAttemptsParams) ([]DeliveryAttempt, error)
+	// Encryption of the endpoint signing secrets at rest (see internal/secretbox).
+	// Endpoints with a secret not (yet) sealed with the current key: plaintext
+	// left from before encryption, or sealed with an older key. Keyset paginated
+	// on id.
+	ListEndpointSecretsToReencrypt(ctx context.Context, arg ListEndpointSecretsToReencryptParams) ([]ListEndpointSecretsToReencryptRow, error)
 	// Keyset pagination on (created_at, id): stable under concurrent inserts and
 	// constant cost per page, unlike OFFSET.
 	ListEndpoints(ctx context.Context, arg ListEndpointsParams) ([]Endpoint, error)
@@ -137,6 +148,10 @@ type Querier interface {
 	RecordEndpointSuccess(ctx context.Context, id uuid.UUID) error
 	// One attempt row per reclaimed delivery, numbered with its new attempt_count.
 	RecordLostAttempts(ctx context.Context, arg RecordLostAttemptsParams) error
+	// Writes re-encrypted secrets, but only if the row still holds the values
+	// they were made from. A secret rotated in the meantime is left alone (0
+	// rows): the rotation already wrote a value sealed with the current key.
+	ReplaceEndpointSecrets(ctx context.Context, arg ReplaceEndpointSecretsParams) (int64, error)
 	// Sends a finished delivery again. Only dead or succeeded deliveries qualify;
 	// the status guard is what makes two simultaneous replays safe (the second
 	// finds the row pending and changes nothing). The retry budget starts over

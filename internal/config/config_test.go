@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"encoding/base64"
 	"log/slog"
 	"strings"
 	"testing"
@@ -181,6 +183,44 @@ func TestRetentionSettings(t *testing.T) {
 	} {
 		if _, err := load(tt.env); err == nil || !strings.Contains(err.Error(), tt.want) {
 			t.Errorf("%s: err = %v, want it to contain %q", name, err, tt.want)
+		}
+	}
+}
+
+func TestSecretEncryptionKeys(t *testing.T) {
+	base := map[string]string{"DATABASE_URL": "postgres://u:p@db/x"}
+	cfg, err := Load(env(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Optional for Load (admin does not need it), required where it matters.
+	if _, err := cfg.RequireSecretKeys(); err == nil || !strings.Contains(err.Error(), "SECRET_ENCRYPTION_KEYS is required") {
+		t.Errorf("RequireSecretKeys without keys: %v", err)
+	}
+
+	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+	other := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32))
+	cfg, err = Load(env(map[string]string{"DATABASE_URL": "postgres://u:p@db/x", "SECRET_ENCRYPTION_KEYS": key + "," + other}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	k, err := cfg.RequireSecretKeys()
+	if err != nil || k == nil {
+		t.Fatalf("RequireSecretKeys with keys: %v", err)
+	}
+
+	for name, v := range map[string]string{
+		"not base64": "nope!",
+		"too short":  base64.StdEncoding.EncodeToString([]byte("short")),
+		"repeated":   key + "," + key,
+	} {
+		_, err := Load(env(map[string]string{"DATABASE_URL": "postgres://u:p@db/x", "SECRET_ENCRYPTION_KEYS": v}))
+		if err == nil || !strings.Contains(err.Error(), "SECRET_ENCRYPTION_KEYS") {
+			t.Errorf("%s: err = %v, want it reported", name, err)
+			continue
+		}
+		if strings.Contains(err.Error(), key) || strings.Contains(err.Error(), v) {
+			t.Errorf("%s: the error repeats the key: %v", name, err)
 		}
 	}
 }
