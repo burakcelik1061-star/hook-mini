@@ -64,6 +64,10 @@ type Config struct {
 	DrainTimeout time.Duration
 	// Retry decides when to retry and when to give up.
 	Retry RetryPolicy
+	// MaxPerEndpoint is the most attempts this worker has in flight to any
+	// one endpoint; zero means no limit. It keeps a slow endpoint from taking
+	// every slot and holding up deliveries to all the others.
+	MaxPerEndpoint int
 	// AutoDisableAfter disables an endpoint once this many consecutive
 	// attempts to it have failed (any success resets the count). Zero turns
 	// the feature off.
@@ -88,6 +92,7 @@ func DefaultConfig() Config {
 		LeaseDuration:  60 * time.Second,
 		RequestTimeout: 15 * time.Second,
 		DrainTimeout:   20 * time.Second,
+		MaxPerEndpoint: 3,
 		Retry:          DefaultRetryPolicy(),
 	}
 }
@@ -106,6 +111,8 @@ func (c Config) validate() error {
 		return errors.New("lease duration must be longer than the request timeout")
 	case c.ReapInterval < 0:
 		return errors.New("reap interval must not be negative")
+	case c.MaxPerEndpoint < 0:
+		return errors.New("per-endpoint maximum must not be negative")
 	case c.AutoDisableAfter < 0:
 		return errors.New("auto-disable threshold must not be negative")
 	case c.DrainTimeout <= 0:
@@ -127,6 +134,12 @@ type Worker struct {
 	log  *slog.Logger
 	cfg  Config
 	http *sender
+
+	// perEndpoint counts this worker's attempts in flight by endpoint.
+	mu          sync.Mutex
+	perEndpoint map[uuid.UUID]int
+	// finishedOne is signalled (without blocking) whenever an attempt ends.
+	finishedOne chan struct{}
 }
 
 // NewWorker validates cfg and returns a Worker.
@@ -154,6 +167,9 @@ func NewWorker(pool *pgxpool.Pool, log *slog.Logger, cfg Config) (*Worker, error
 		log:  log.With("worker_id", cfg.ID),
 		cfg:  cfg,
 		http: newSender(transport, cfg.RequestTimeout),
+
+		perEndpoint: map[uuid.UUID]int{},
+		finishedOne: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -221,15 +237,25 @@ func (w *Worker) Run(ctx context.Context) error {
 
 		for _, job := range jobs {
 			inFlight.Add(1)
+			w.started(job.EndpointID)
 			go func() {
 				defer inFlight.Done()
 				defer func() { <-slots }()
+				defer w.finished(job.EndpointID)
 				w.process(attemptCtx, job)
 			}()
 		}
 		if len(jobs) < n {
-			// The queue has no more due work right now.
-			sleep(ctx, w.cfg.PollInterval)
+			if w.anyBusy() {
+				// Short because endpoints are at their per-endpoint maximum,
+				// not because the queue is empty: there may well be due work
+				// for them. Look again as soon as an attempt finishes (which
+				// frees its endpoint), not a whole poll interval later.
+				w.waitForFinish(ctx, w.cfg.PollInterval)
+			} else {
+				// The queue has no more due work right now.
+				sleep(ctx, w.cfg.PollInterval)
+			}
 		}
 	}
 
@@ -263,11 +289,89 @@ func (w *Worker) claim(ctx context.Context, n int) ([]store.ClaimDueDeliveriesRo
 	}
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), recordTimeout)
 	defer cancel()
+	busy, perEndpoint := w.endpointRoom(n)
 	return w.q.ClaimDueDeliveries(cctx, store.ClaimDueDeliveriesParams{
-		LeaseMs:   w.cfg.LeaseDuration.Milliseconds(),
-		WorkerID:  w.cfg.ID,
-		BatchSize: int32(n),
+		LeaseMs:       w.cfg.LeaseDuration.Milliseconds(),
+		WorkerID:      w.cfg.ID,
+		BusyEndpoints: busy,
+		// A few candidates per slot, so a crowded endpoint at the head of the
+		// queue (more due than PerEndpoint) does not hide the work behind
+		// it. Busy endpoints are filtered out before this limit applies.
+		// Every candidate is row-locked for the statement, and a row lock is
+		// written to the WAL, so this is kept small.
+		ScanSize:    int32(min(max(n*claimScanFactor, 32), 1000)),
+		PerEndpoint: int64(perEndpoint),
+		BatchSize:   int32(n),
 	})
+}
+
+// claimScanFactor is how many candidates the claim looks at per slot to fill.
+const claimScanFactor = 4
+
+// endpointRoom returns the endpoints this worker must not claim for (they
+// have MaxPerEndpoint attempts in flight) and the most one claim may take for
+// any single endpoint. A claim can still bring an endpoint up to almost twice
+// the limit (in flight below it, then a full share in one claim); the bound
+// is then 2*MaxPerEndpoint-1, never the whole batch.
+func (w *Worker) endpointRoom(n int) (busy []uuid.UUID, perEndpoint int) {
+	if w.cfg.MaxPerEndpoint == 0 {
+		return []uuid.UUID{}, n
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	busy = []uuid.UUID{}
+	for id, inFlight := range w.perEndpoint {
+		if inFlight >= w.cfg.MaxPerEndpoint {
+			busy = append(busy, id)
+		}
+	}
+	return busy, w.cfg.MaxPerEndpoint
+}
+
+func (w *Worker) started(endpointID uuid.UUID) {
+	w.mu.Lock()
+	w.perEndpoint[endpointID]++
+	w.mu.Unlock()
+}
+
+func (w *Worker) finished(endpointID uuid.UUID) {
+	w.mu.Lock()
+	if w.perEndpoint[endpointID]--; w.perEndpoint[endpointID] <= 0 {
+		delete(w.perEndpoint, endpointID) // the map holds only endpoints in flight
+	}
+	w.mu.Unlock()
+	select {
+	case w.finishedOne <- struct{}{}:
+	default: // a wake-up is already pending
+	}
+}
+
+// anyBusy reports whether some endpoint has the per-endpoint maximum in
+// flight, which is what can make a claim come back short with work left.
+func (w *Worker) anyBusy() bool {
+	if w.cfg.MaxPerEndpoint == 0 {
+		return false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, n := range w.perEndpoint {
+		if n >= w.cfg.MaxPerEndpoint {
+			return true
+		}
+	}
+	return false
+}
+
+// waitForFinish returns when an attempt finishes, after at most d, or when
+// ctx ends.
+func (w *Worker) waitForFinish(ctx context.Context, d time.Duration) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-w.finishedOne:
+	case <-t.C:
+	case <-ctx.Done():
+	}
 }
 
 // process makes one attempt for a claimed delivery and records the outcome.

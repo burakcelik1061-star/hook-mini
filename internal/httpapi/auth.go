@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"context"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/burakcelik1061-star/hook-mini/internal/service"
@@ -33,6 +35,31 @@ func (h *handlers) authenticate(next http.Handler) http.Handler {
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalKey{}, p)))
+	})
+}
+
+// rateLimit spends one unit of the tenant's request budget. It runs after
+// authenticate, so the budget belongs to the tenant and is shared by all of
+// its API keys: opening more keys does not buy more requests.
+func (h *handlers) rateLimit(next http.Handler) http.Handler {
+	if h.limiter == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		d := h.limiter.Allow(principalFrom(r.Context()).TenantID.String())
+		w.Header().Set("RateLimit-Limit", strconv.Itoa(d.Limit))
+		w.Header().Set("RateLimit-Remaining", strconv.Itoa(d.Remaining))
+		if !d.Allowed {
+			// Whole seconds, rounded up: a client that waits this long is
+			// allowed, and 0 would invite an immediate retry.
+			w.Header().Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(d.RetryAfter.Seconds())))))
+			writeAPIError(w, r, &apiError{
+				Status: http.StatusTooManyRequests, Code: "rate_limited",
+				Message: "too many requests for this tenant; retry after the number of seconds in Retry-After",
+			})
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 

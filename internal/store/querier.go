@@ -35,6 +35,19 @@ type Querier interface {
 	// it once per outer row. Each run skips the rows it already locked and locks
 	// new ones, so the claim could return more than batch_size rows. A
 	// materialized CTE runs exactly once (see TestClaimLocksOnce).
+	//
+	// Per-endpoint fairness: without it one slow endpoint can take every worker
+	// slot and hold up all the others. The worker passes the endpoints that
+	// already have its per-endpoint maximum in flight (busy_endpoints), which are
+	// skipped, and per_endpoint, the most one claim takes for any one endpoint.
+	// Postgres does not allow a window function in a query that locks rows, so
+	// the earliest due deliveries are locked and numbered per endpoint first
+	// (candidates, at most scan_size rows) and the ones to take are picked in a
+	// second step. The candidates must be locked (SKIP LOCKED) already: unlocked,
+	// every concurrent claimer would pick the same first rows, all but one would
+	// find them taken and come back empty (TestClaimUnderHeavyContention). Locks
+	// on candidates that are not taken end with the statement. The status and
+	// due time are checked again on the locked row.
 	ClaimDueDeliveries(ctx context.Context, arg ClaimDueDeliveriesParams) ([]ClaimDueDeliveriesRow, error)
 	CountDeliveriesForEvent(ctx context.Context, arg CountDeliveriesForEventParams) (int64, error)
 	// How many stored secrets each key sealed; key_id is '' for a value that is

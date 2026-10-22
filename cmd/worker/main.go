@@ -64,6 +64,7 @@ func run() error {
 			MaxBackoff:     wc.BackoffMax,
 		},
 		AutoDisableAfter:     wc.AutoDisableAfter,
+		MaxPerEndpoint:       wc.MaxPerEndpoint,
 		AllowPrivateNetworks: cfg.AllowPrivateDestinations,
 		Keys:                 keys,
 	})

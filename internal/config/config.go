@@ -40,6 +40,11 @@ type Config struct {
 	RetentionPeriod time.Duration
 	// CleanupInterval is how often the worker deletes what has expired.
 	CleanupInterval time.Duration
+	// RateLimitRPS is each tenant's sustained request rate on /v1 (per api
+	// instance); zero turns the limit off. RateLimitBurst is how many
+	// requests may come at once.
+	RateLimitRPS   float64
+	RateLimitBurst int
 	// SecretKeys encrypt the endpoint signing secrets stored in the
 	// database (SECRET_ENCRYPTION_KEYS). Nil when unset; the binaries that
 	// need them ask through RequireSecretKeys.
@@ -76,6 +81,9 @@ type Worker struct {
 	// AutoDisableAfter disables an endpoint after this many consecutive
 	// failed attempts; 0 turns it off.
 	AutoDisableAfter int
+	// MaxPerEndpoint caps one worker's attempts in flight to any one
+	// endpoint; 0 means no cap.
+	MaxPerEndpoint int
 }
 
 // Load builds a Config from getenv (usually os.Getenv). All problems are
@@ -158,6 +166,7 @@ func Load(getenv func(string) string) (Config, error) {
 		BackoffMax:     duration("DELIVERY_BACKOFF_MAX", "6h", 100*time.Millisecond, 7*24*time.Hour),
 
 		AutoDisableAfter: integer("ENDPOINT_AUTO_DISABLE_AFTER", 100, 0, 1_000_000),
+		MaxPerEndpoint:   integer("WORKER_MAX_PER_ENDPOINT", 3, 0, 1000),
 	}
 	// A lease shorter than a request (plus time to record the result) would
 	// let healthy attempts be reclaimed and sent twice.
@@ -180,6 +189,13 @@ func Load(getenv func(string) string) (Config, error) {
 		fail("RETENTION_PERIOD (%s) must be 0 (keep forever) or at least %s", cfg.RetentionPeriod, MinRetentionPeriod)
 	}
 	cfg.CleanupInterval = duration("CLEANUP_INTERVAL", "1h", time.Minute, 24*time.Hour)
+
+	if v, err := strconv.ParseFloat(get("RATE_LIMIT_RPS", "50"), 64); err != nil || v < 0 || v > 100_000 || v != v {
+		fail("RATE_LIMIT_RPS must be a number between 0 (no limit) and 100000")
+	} else {
+		cfg.RateLimitRPS = v
+	}
+	cfg.RateLimitBurst = integer("RATE_LIMIT_BURST", 100, 1, 1_000_000)
 
 	if v := get("SECRET_ENCRYPTION_KEYS", ""); v != "" {
 		k, err := secretbox.ParseKeys(v)

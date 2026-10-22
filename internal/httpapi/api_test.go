@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/burakcelik1061-star/hook-mini/internal/database"
+	"github.com/burakcelik1061-star/hook-mini/internal/ratelimit"
 	"github.com/burakcelik1061-star/hook-mini/internal/secretbox/secretboxtest"
 	"github.com/burakcelik1061-star/hook-mini/internal/service"
 )
@@ -755,6 +756,67 @@ func TestInternalErrorsDoNotLeak(t *testing.T) {
 	for _, leak := range []string{"pool", "closed", "pgx", "127.0.0.1", "hookmini", "sql", "dial"} {
 		if strings.Contains(strings.ToLower(string(res.Body)), leak) {
 			t.Errorf("a 500 response leaks internals (%q): %s", leak, res.Body)
+		}
+	}
+}
+
+// The budget belongs to the tenant: its API keys share it, other tenants do
+// not, and requests that fail authentication do not spend it.
+func TestRateLimitIsPerTenant(t *testing.T) {
+	if testPool == nil {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	svc := service.New(testPool, testLog, service.WithSecretKeys(secretboxtest.Keyring()))
+	// Three requests, then (practically) no refill.
+	limiter := ratelimit.New(1.0/(7*24*3600), 3, nil)
+	srv := httptest.NewServer(NewRouter(Deps{Log: testLog, DB: testPool, Svc: svc, Limiter: limiter}))
+	t.Cleanup(srv.Close)
+
+	a := newTenantClient(t, srv, svc)
+	_, secondKey, err := svc.IssueAPIKey(context.Background(), a.tenant, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := newTenantClient(t, srv, svc)
+
+	// A request that fails authentication is answered 401 and costs nothing.
+	if res := rawSend(t, srv, "GET", "/v1/endpoints", "hm_00000000_"+strings.Repeat("a", 64), nil); res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("bad key: %d", res.StatusCode)
+	}
+
+	for i, want := range []string{"2", "1", "0"} {
+		res := a.send("GET", "/v1/endpoints", nil)
+		if res.StatusCode != http.StatusOK || res.Header.Get("RateLimit-Remaining") != want || res.Header.Get("RateLimit-Limit") != "3" {
+			t.Fatalf("request %d: %d, RateLimit-Remaining %q (want %s)", i+1, res.StatusCode, res.Header.Get("RateLimit-Remaining"), want)
+		}
+	}
+	// A second key of the same tenant draws on the same, now empty, budget.
+	res := rawSend(t, srv, "POST", "/v1/events", secondKey, map[string]any{"type": "a.b", "payload": map[string]any{}})
+	if res.StatusCode != http.StatusTooManyRequests || res.errorCode() != "rate_limited" {
+		t.Fatalf("second key of the same tenant: %d %s, want 429 rate_limited", res.StatusCode, res.Body)
+	}
+	var events int
+	if err := testPool.QueryRow(context.Background(), `SELECT count(*) FROM events WHERE tenant_id = $1`, a.tenant).Scan(&events); err != nil || events != 0 {
+		t.Errorf("a refused request still created %d events (err %v)", events, err)
+	}
+	// Another tenant is unaffected.
+	if res := b.send("GET", "/v1/endpoints", nil); res.StatusCode != http.StatusOK {
+		t.Errorf("another tenant was limited: %d", res.StatusCode)
+	}
+	// Operational endpoints are never limited.
+	if res := rawSend(t, srv, "GET", "/healthz", "", nil); res.StatusCode != http.StatusOK || res.Header.Get("RateLimit-Limit") != "" {
+		t.Errorf("/healthz: %d, RateLimit-Limit %q", res.StatusCode, res.Header.Get("RateLimit-Limit"))
+	}
+}
+
+// Without a limiter there is no limit and no RateLimit headers.
+func TestNoLimiterNoLimit(t *testing.T) {
+	srv, svc := newServer(t)
+	c := newTenantClient(t, srv, svc)
+	for range 20 {
+		res := c.send("GET", "/v1/endpoints", nil)
+		if res.StatusCode != http.StatusOK || res.Header.Get("RateLimit-Limit") != "" {
+			t.Fatalf("%d, RateLimit-Limit %q", res.StatusCode, res.Header.Get("RateLimit-Limit"))
 		}
 	}
 }

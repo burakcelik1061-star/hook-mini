@@ -10,13 +10,15 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/burakcelik1061-star/hook-mini/internal/ratelimit"
 	"github.com/burakcelik1061-star/hook-mini/internal/service"
 	"github.com/burakcelik1061-star/hook-mini/internal/store"
 )
 
 type handlers struct {
-	svc *service.Service
-	log *slog.Logger
+	svc     *service.Service
+	log     *slog.Logger
+	limiter *ratelimit.Limiter // nil: no limit
 }
 
 // Response types. Responses are built from these explicit structs, never from

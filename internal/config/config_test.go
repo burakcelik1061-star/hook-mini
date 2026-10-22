@@ -77,7 +77,7 @@ func TestWorkerDefaults(t *testing.T) {
 		Concurrency: 10, BatchSize: 10, PollInterval: 500 * time.Millisecond,
 		LeaseDuration: 60 * time.Second, RequestTimeout: 15 * time.Second,
 		MaxAttempts: 8, BackoffInitial: 30 * time.Second, BackoffMax: 6 * time.Hour,
-		AutoDisableAfter: 100,
+		AutoDisableAfter: 100, MaxPerEndpoint: 3,
 	}
 	if cfg.Worker != want {
 		t.Errorf("worker defaults = %+v, want %+v", cfg.Worker, want)
@@ -247,5 +247,37 @@ func TestLoadRequiresDatabaseURL(t *testing.T) {
 	_, err := Load(env(nil))
 	if err == nil || !strings.Contains(err.Error(), "DATABASE_URL is required") {
 		t.Fatalf("err = %v, want DATABASE_URL is required", err)
+	}
+}
+
+func TestRateLimitSettings(t *testing.T) {
+	load := func(extra map[string]string) (Config, error) {
+		e := map[string]string{"DATABASE_URL": "postgres://u:p@db/x"}
+		for k, v := range extra {
+			e[k] = v
+		}
+		return Load(env(e))
+	}
+	cfg, err := load(nil)
+	if err != nil || cfg.RateLimitRPS != 50 || cfg.RateLimitBurst != 100 {
+		t.Fatalf("defaults: %v/%v, %v; want 50/s and 100", cfg.RateLimitRPS, cfg.RateLimitBurst, err)
+	}
+	if cfg, err := load(map[string]string{"RATE_LIMIT_RPS": "0"}); err != nil || cfg.RateLimitRPS != 0 {
+		t.Errorf("RATE_LIMIT_RPS=0 (off): %v, %v", cfg.RateLimitRPS, err)
+	}
+	if cfg, err := load(map[string]string{"RATE_LIMIT_RPS": "2.5", "RATE_LIMIT_BURST": "1"}); err != nil || cfg.RateLimitRPS != 2.5 || cfg.RateLimitBurst != 1 {
+		t.Errorf("fractional rate, burst 1: %+v, %v", cfg, err)
+	}
+	for name, e := range map[string]map[string]string{
+		"negative rate": {"RATE_LIMIT_RPS": "-1"},
+		"not a number":  {"RATE_LIMIT_RPS": "fast"},
+		"NaN":           {"RATE_LIMIT_RPS": "NaN"},
+		"absurd rate":   {"RATE_LIMIT_RPS": "1e9"},
+		"zero burst":    {"RATE_LIMIT_BURST": "0"},
+		"burst not int": {"RATE_LIMIT_BURST": "lots"},
+	} {
+		if _, err := load(e); err == nil || !strings.Contains(err.Error(), "RATE_LIMIT_") {
+			t.Errorf("%s: err = %v", name, err)
+		}
 	}
 }

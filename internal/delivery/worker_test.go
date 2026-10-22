@@ -1328,6 +1328,7 @@ func TestNewWorkerRejectsBadConfig(t *testing.T) {
 		"no drain":               func(c *Config) { c.DrainTimeout = 0 },
 		"bad retry policy":       func(c *Config) { c.Retry.MaxAttempts = 0 },
 		"no encryption keys":     func(c *Config) { c.Keys = nil },
+		"negative per endpoint":  func(c *Config) { c.MaxPerEndpoint = -1 },
 	} {
 		c := ok
 		mutate(&c)
@@ -1346,4 +1347,78 @@ func TestNewWorkerRejectsBadConfig(t *testing.T) {
 	if w.cfg.BatchSize != 2 || w.cfg.ReapInterval != 30*time.Second || w.ID() == "" {
 		t.Errorf("defaults not applied: batch=%d reap=%s id=%q", w.cfg.BatchSize, w.cfg.ReapInterval, w.ID())
 	}
+}
+
+// A slow endpoint must not take every slot. Its deliveries come first in the
+// queue and it never answers while the test watches; with a per-endpoint
+// maximum the other endpoint is still served.
+func TestSlowEndpointLeavesSlotsForOthers(t *testing.T) {
+	f := newFixture(t)
+	release := make(chan struct{})
+	unblock := releaseOnCleanup(t, release)
+	var inFlight, maxInFlight atomic.Int32
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := inFlight.Add(1)
+		defer inFlight.Add(-1)
+		for {
+			m := maxInFlight.Load()
+			if n <= m || maxInFlight.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(slow.Close)
+	f.endpoint(slow.URL)
+	f.events(8) // 8 deliveries to the slow endpoint, first in the queue
+
+	fast, rec := newRecorder(t, nil)
+	f.endpoint(fast.URL)
+	f.events(4) // 4 more for the slow endpoint, and 4 for the fast one
+
+	cfg := testConfig("w-fair")
+	cfg.Concurrency, cfg.BatchSize = 4, 4
+	cfg.RequestTimeout, cfg.LeaseDuration = 10*time.Second, 20*time.Second
+	cfg.MaxPerEndpoint = 2
+	f.start(cfg)
+	// Registered after start, so on failure it runs before the worker is
+	// stopped: the slow requests end at once instead of holding up shutdown.
+	t.Cleanup(unblock)
+
+	f.waitFor(5*time.Second, "the fast endpoint's deliveries while the slow one hangs", func() bool { return rec.count() == 4 })
+	// In flight to the slow endpoint: at most the maximum, plus what one claim
+	// can add on top of it (see endpointRoom), never the whole batch.
+	if m := maxInFlight.Load(); m > int32(2*cfg.MaxPerEndpoint-1) || m < 1 {
+		t.Errorf("%d attempts were in flight to the slow endpoint at once, want 1..%d", m, 2*cfg.MaxPerEndpoint-1)
+	}
+
+	unblock()
+	f.waitStatus(10*time.Second, "succeeded", 16)
+	f.assertInvariant()
+}
+
+// Regression (found by the load measurement): a claim that comes back short
+// because endpoints are at their maximum is not an empty queue. The worker
+// slept a whole poll interval after it, so with the per-endpoint maximum on,
+// throughput collapsed (357 to 80 deliveries/s). It must look again as soon
+// as an attempt finishes.
+func TestPerEndpointMaximumDoesNotWaitForThePollInterval(t *testing.T) {
+	f := newFixture(t)
+	srv, rec := newRecorder(t, nil) // answers at once
+	f.endpoint(srv.URL)
+	f.events(20)
+
+	cfg := testConfig("w-no-idle")
+	cfg.MaxPerEndpoint = 1
+	cfg.PollInterval = 2 * time.Second // long, so idling after a short claim shows
+	start := time.Now()
+	f.start(cfg)
+	f.waitFor(10*time.Second, "all 20 deliveries", func() bool { return rec.count() == 20 })
+	if took := time.Since(start); took > 3*time.Second {
+		t.Errorf("20 deliveries to a fast endpoint took %s: the worker idled for the poll interval between claims", took.Round(time.Millisecond))
+	}
+	f.assertInvariant()
 }

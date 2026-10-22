@@ -6,6 +6,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -63,8 +64,8 @@ WHERE id = (SELECT id FROM deliveries WHERE tenant_id = (SELECT id FROM tenants 
 		sql  string
 		args []any
 	}{
-		"ClaimDueDeliveries":   {claimDueDeliveries, []any{int64(1000), "w", int32(1)}},   // lease_ms, worker_id, batch_size
-		"ReclaimExpiredLeases": {reclaimExpiredLeases, []any{int32(5), "test", int32(1)}}, // max_attempts, reason, batch_size
+		"ClaimDueDeliveries":   {claimDueDeliveries, []any{int64(1000), "w", []uuid.UUID{}, int32(100), int64(1), int32(1)}}, // lease_ms, worker_id, busy_endpoints, scan_size, per_endpoint, batch_size
+		"ReclaimExpiredLeases": {reclaimExpiredLeases, []any{int32(5), "test", int32(1)}},                                    // max_attempts, reason, batch_size
 	} {
 		t.Run(name, func(t *testing.T) {
 			sp, err := tx.Begin(ctx) // savepoint: EXPLAIN ANALYZE really runs the UPDATE

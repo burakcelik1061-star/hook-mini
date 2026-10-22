@@ -829,3 +829,130 @@ func TestWorkerIndexesMatchTheirQueries(t *testing.T) {
 		t.Errorf("the due-work query does not use deliveries_due_idx:\n%s", plan.String())
 	}
 }
+
+// The claim takes at most per_endpoint deliveries for any one endpoint, skips
+// the endpoints the worker reports as busy, and otherwise keeps queue order.
+func TestClaimSharesSlotsBetweenEndpoints(t *testing.T) {
+	ctx, tx, q := begin(t)
+	tn := newTenant(t, ctx, q)
+	hot := newEndpoint(t, ctx, q, tn.ID)
+	// Five events while only the hot endpoint exists: five deliveries for it.
+	for range 5 {
+		ev := newEvent(t, ctx, q, tn.ID, nil)
+		if _, err := q.CreateDeliveriesForEvent(ctx, store.CreateDeliveriesForEventParams{EventID: ev.ID, TenantID: tn.ID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Two more after the cold endpoint exists: each goes to both, so the hot
+	// endpoint has 7 deliveries and the cold one 2.
+	cold := newEndpoint(t, ctx, q, tn.ID)
+	for range 2 {
+		ev := newEvent(t, ctx, q, tn.ID, nil)
+		if _, err := q.CreateDeliveriesForEvent(ctx, store.CreateDeliveriesForEventParams{EventID: ev.ID, TenantID: tn.ID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Other tests may have pending deliveries in this database too; put this
+	// test's at the very head of the queue so a batch reaches them first.
+	if _, err := tx.Exec(ctx, `UPDATE deliveries SET next_attempt_at = '2000-01-01' WHERE tenant_id = $1`, tn.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	claim := func(busy []uuid.UUID, perEndpoint int64, batch int32) map[uuid.UUID]int {
+		t.Helper()
+		rows, err := q.ClaimDueDeliveries(ctx, store.ClaimDueDeliveriesParams{
+			LeaseMs: 60_000, WorkerID: "w", BusyEndpoints: busy, ScanSize: 100, PerEndpoint: perEndpoint, BatchSize: batch,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[uuid.UUID]int{}
+		for _, r := range rows {
+			if r.TenantID == tn.ID {
+				got[r.EndpointID]++
+			}
+		}
+		return got
+	}
+
+	// The hot endpoint is busy: only the cold one's deliveries are claimed.
+	if got := claim([]uuid.UUID{hot.ID}, 10, 10); got[hot.ID] != 0 || got[cold.ID] != 2 {
+		t.Fatalf("with the hot endpoint busy: %v, want only the 2 cold deliveries", got)
+	}
+	// Not busy, but at most 2 per endpoint in one claim, although the batch
+	// has room for more and the hot deliveries come first in the queue.
+	if got := claim([]uuid.UUID{}, 2, 10); got[hot.ID] != 2 {
+		t.Fatalf("per-endpoint cap: %v, want 2 hot deliveries", got)
+	}
+	// No cap (per_endpoint = batch): the rest of the queue in order.
+	if got := claim([]uuid.UUID{}, 10, 10); got[hot.ID] != 5 {
+		t.Fatalf("without a cap: %v, want the remaining 5 hot deliveries", got)
+	}
+}
+
+// Another claim in progress holds the first rows of the queue. A claim must
+// look past them and take the next ones, not pick the same first rows, find
+// them held and come back empty (which would make concurrent workers starve
+// each other). Deterministic: the "other claim" is a transaction holding the
+// row locks.
+func TestClaimLooksPastRowsAnotherClaimHolds(t *testing.T) {
+	if testPool == nil {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	q := store.New(testPool)
+	tn := newTenant(t, ctx, q)
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM tenants WHERE id = $1`, tn.ID) })
+	newEndpoint(t, ctx, q, tn.ID)
+	for range 10 {
+		ev := newEvent(t, ctx, q, tn.ID, nil)
+		if _, err := q.CreateDeliveriesForEvent(ctx, store.CreateDeliveriesForEventParams{EventID: ev.ID, TenantID: tn.ID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A strict order at the head of the queue, ahead of other tests' rows.
+	if _, err := testPool.Exec(ctx, `UPDATE deliveries d SET next_attempt_at = '2000-01-01'::timestamptz + o.n * interval '1 second'
+		FROM (SELECT id, row_number() OVER (ORDER BY id) AS n FROM deliveries WHERE tenant_id = $1) o
+		WHERE d.id = o.id`, tn.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	holder, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(ctx)
+	held := map[uuid.UUID]bool{}
+	rows, err := holder.Query(ctx, `SELECT id FROM deliveries WHERE tenant_id = $1 ORDER BY next_attempt_at LIMIT 5 FOR UPDATE`, tn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		held[id] = true
+	}
+	rows.Close()
+
+	claimed, err := q.ClaimDueDeliveries(ctx, store.ClaimDueDeliveriesParams{
+		LeaseMs: 60_000, WorkerID: "w", BusyEndpoints: []uuid.UUID{}, ScanSize: 32, PerEndpoint: 5, BatchSize: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine := 0
+	for _, c := range claimed {
+		if c.TenantID != tn.ID {
+			continue
+		}
+		mine++
+		if held[c.ID] {
+			t.Errorf("claimed %s, which another transaction holds", c.ID)
+		}
+	}
+	if mine != 5 {
+		t.Errorf("claimed %d of the 5 free deliveries behind the held ones", mine)
+	}
+}

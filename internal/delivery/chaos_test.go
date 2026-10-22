@@ -158,6 +158,9 @@ func TestChaos(t *testing.T) {
 	cfg := func(id string) Config {
 		c := testConfig(id)
 		c.Concurrency, c.BatchSize = 6, 4
+		// A per-endpoint limit, so the claim's busy-endpoint and per-endpoint
+		// paths run under the chaos too.
+		c.MaxPerEndpoint = 3
 		c.PollInterval = 5 * time.Millisecond
 		c.LeaseDuration, c.RequestTimeout = 800*time.Millisecond, 150*time.Millisecond
 		c.ReapInterval = 100 * time.Millisecond

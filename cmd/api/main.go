@@ -13,6 +13,7 @@ import (
 	"github.com/burakcelik1061-star/hook-mini/internal/httpapi"
 	"github.com/burakcelik1061-star/hook-mini/internal/lifecycle"
 	"github.com/burakcelik1061-star/hook-mini/internal/logging"
+	"github.com/burakcelik1061-star/hook-mini/internal/ratelimit"
 	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
 	"github.com/burakcelik1061-star/hook-mini/internal/service"
 )
@@ -56,12 +57,20 @@ func run() error {
 		return err
 	}
 
+	var limiter *ratelimit.Limiter
+	if cfg.RateLimitRPS > 0 {
+		limiter = ratelimit.New(cfg.RateLimitRPS, cfg.RateLimitBurst, nil)
+		log.Info("per-tenant rate limit", "rps", cfg.RateLimitRPS, "burst", cfg.RateLimitBurst, "scope", "per api instance")
+	} else {
+		log.Warn("RATE_LIMIT_RPS is 0: tenants are not rate limited")
+	}
+
 	ln, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.HTTPAddr, err)
 	}
 	srv := &http.Server{
-		Handler:           httpapi.NewRouter(httpapi.Deps{Log: log, DB: pool, Svc: svc}),
+		Handler:           httpapi.NewRouter(httpapi.Deps{Log: log, DB: pool, Svc: svc, Limiter: limiter}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,

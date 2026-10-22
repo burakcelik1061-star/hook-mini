@@ -136,6 +136,7 @@ paths:
                 $ref: "#/components/schemas/Endpoint"
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "413": { $ref: "#/components/responses/PayloadTooLarge" }
         "415": { $ref: "#/components/responses/UnsupportedMediaType" }
         "500": { $ref: "#/components/responses/InternalError" }
@@ -155,6 +156,7 @@ paths:
                 $ref: "#/components/schemas/EndpointList"
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "500": { $ref: "#/components/responses/InternalError" }
 
   /v1/endpoints/{id}:
@@ -172,6 +174,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Endpoint"
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
     patch:
@@ -194,6 +197,7 @@ paths:
                 $ref: "#/components/schemas/Endpoint"
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "404": { $ref: "#/components/responses/NotFound" }
         "413": { $ref: "#/components/responses/PayloadTooLarge" }
         "415": { $ref: "#/components/responses/UnsupportedMediaType" }
@@ -206,6 +210,7 @@ paths:
         "204":
           description: Deleted.
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
 
@@ -230,6 +235,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Endpoint"
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
 
@@ -251,6 +257,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Endpoint"
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
 
@@ -270,6 +277,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Endpoint"
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
 
@@ -328,6 +336,7 @@ paths:
                 $ref: "#/components/schemas/Event"
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "413": { $ref: "#/components/responses/PayloadTooLarge" }
         "415": { $ref: "#/components/responses/UnsupportedMediaType" }
         "422": { $ref: "#/components/responses/IdempotencyKeyReuse" }
@@ -348,6 +357,7 @@ paths:
                 $ref: "#/components/schemas/EventList"
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "500": { $ref: "#/components/responses/InternalError" }
 
   /v1/events/{id}:
@@ -366,6 +376,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Event"
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
 
@@ -396,6 +407,7 @@ paths:
                 $ref: "#/components/schemas/DeliveryList"
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "500": { $ref: "#/components/responses/InternalError" }
 
   /v1/deliveries/{id}:
@@ -413,6 +425,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Delivery"
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/InternalError" }
 
@@ -437,6 +450,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Delivery"
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { $ref: "#/components/responses/ReplayConflict" }
         "500": { $ref: "#/components/responses/InternalError" }
@@ -538,6 +552,27 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
+    TooManyRequests:
+      description: |
+        The tenant has used up its request budget (`rate_limited`). Every
+        `/v1` request of a tenant, whichever API key it uses, draws on one
+        budget: a sustained rate with room for short bursts. Wait the number
+        of seconds in `Retry-After`. Successful responses carry the budget
+        too, in `RateLimit-Limit` and `RateLimit-Remaining`. The limit is
+        enforced per api instance.
+      headers:
+        Retry-After:
+          description: Seconds to wait before the next request is allowed.
+          schema: { type: integer, minimum: 1 }
+        RateLimit-Limit:
+          description: The size of the tenant's burst budget.
+          schema: { type: integer }
+        RateLimit-Remaining:
+          description: Requests left in the burst budget right now.
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
     NotFound:
       description: No such resource for this tenant. Another tenant's id gets the same answer.
       content:
@@ -607,6 +642,7 @@ components:
                 - idempotency_key_reuse
                 - delivery_not_replayable
                 - endpoint_disabled
+                - rate_limited
                 - internal_error
             message:
               type: string

@@ -24,13 +24,41 @@
 -- it once per outer row. Each run skips the rows it already locked and locks
 -- new ones, so the claim could return more than batch_size rows. A
 -- materialized CTE runs exactly once (see TestClaimLocksOnce).
-WITH due AS MATERIALIZED (
-    SELECT id
-    FROM deliveries
-    WHERE status = 'pending' AND next_attempt_at <= now()
-    ORDER BY next_attempt_at
+--
+-- Per-endpoint fairness: without it one slow endpoint can take every worker
+-- slot and hold up all the others. The worker passes the endpoints that
+-- already have its per-endpoint maximum in flight (busy_endpoints), which are
+-- skipped, and per_endpoint, the most one claim takes for any one endpoint.
+-- Postgres does not allow a window function in a query that locks rows, so
+-- the earliest due deliveries are locked and numbered per endpoint first
+-- (candidates, at most scan_size rows) and the ones to take are picked in a
+-- second step. The candidates must be locked (SKIP LOCKED) already: unlocked,
+-- every concurrent claimer would pick the same first rows, all but one would
+-- find them taken and come back empty (TestClaimUnderHeavyContention). Locks
+-- on candidates that are not taken end with the statement. The status and
+-- due time are checked again on the locked row.
+WITH candidates AS MATERIALIZED (
+    SELECT id, next_attempt_at,
+           row_number() OVER (PARTITION BY endpoint_id ORDER BY next_attempt_at, id) AS nth
+    FROM (
+        SELECT id, endpoint_id, next_attempt_at
+        FROM deliveries
+        WHERE status = 'pending' AND next_attempt_at <= now()
+          AND endpoint_id <> ALL (sqlc.arg(busy_endpoints)::uuid[])
+        ORDER BY next_attempt_at
+        LIMIT sqlc.arg(scan_size)
+        FOR UPDATE SKIP LOCKED
+    ) earliest
+),
+due AS MATERIALIZED (
+    SELECT d.id
+    FROM deliveries d, candidates c
+    WHERE c.id = d.id
+      AND c.nth <= sqlc.arg(per_endpoint)::bigint
+      AND d.status = 'pending' AND d.next_attempt_at <= now()
+    ORDER BY c.next_attempt_at
     LIMIT sqlc.arg(batch_size)
-    FOR UPDATE SKIP LOCKED
+    FOR UPDATE OF d SKIP LOCKED
 )
 UPDATE deliveries d
 SET status       = 'in_flight',

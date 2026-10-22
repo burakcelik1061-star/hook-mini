@@ -325,6 +325,21 @@ specification's published example.
 (once). For 24 hours requests carry two signatures, one per secret, so the
 receiver can switch whenever it is ready without rejecting a delivery.
 
+### Rate limits and fairness
+
+Every `/v1` request draws on its tenant's budget (`RATE_LIMIT_RPS`, default
+50/s, bursts up to `RATE_LIMIT_BURST`, 100): a token bucket per tenant, so
+opening more API keys does not buy more requests. Over budget the answer is
+`429 rate_limited` with `Retry-After`; every response carries
+`RateLimit-Limit` and `RateLimit-Remaining`. The buckets live in the api's
+memory (a database write per request would lower the very ceiling the load
+measurements found), so each api instance enforces the limit on its own.
+
+On the delivery side, `WORKER_MAX_PER_ENDPOINT` (default 3) caps how many
+attempts one worker has in flight to any one endpoint: a slow or hanging
+endpoint cannot take every slot. The claim query skips endpoints at their
+maximum and takes at most that many per endpoint in one claim.
+
 ### Signing secrets at rest
 
 Signing needs the raw secret, so it cannot be hashed like an API key; instead
@@ -394,6 +409,7 @@ reported together at startup. `.env.example` lists them.
 | `HTTP_ADDR` | `:8080` | api | listen address |
 | `LOG_LEVEL` / `LOG_FORMAT` | `info` / `json` | all | `json` for production, `text` for a terminal |
 | `SHUTDOWN_TIMEOUT` | `20s` | api, worker | how long to wait for work in flight on `SIGTERM`; must be ≥ `DELIVERY_TIMEOUT` + 5s |
+| `RATE_LIMIT_RPS` / `_BURST` | `50` / `100` | api | each tenant's request budget on `/v1` (per api instance); `0` = no limit |
 | `SECRET_ENCRYPTION_KEYS` | (required) | api, worker, migrate | base64 32-byte keys, comma-separated, the current one first; they encrypt the endpoint signing secrets at rest |
 | `ALLOW_PRIVATE_DESTINATIONS` | `false` | api, worker | **development only**: allow loopback/private targets |
 | `WORKER_ID` | generated | worker | name in leases and logs |
@@ -404,6 +420,7 @@ reported together at startup. `.env.example` lists them.
 | `DELIVERY_TIMEOUT` | `15s` | worker | one attempt, reading the response included |
 | `DELIVERY_MAX_ATTEMPTS` | `8` | worker | per round (a replay starts a new round) |
 | `DELIVERY_BACKOFF_INITIAL` / `_MAX` | `30s` / `6h` | worker | retry waits |
+| `WORKER_MAX_PER_ENDPOINT` | `3` | worker | most attempts one worker has in flight to any one endpoint; `0` = no cap |
 | `ENDPOINT_AUTO_DISABLE_AFTER` | `100` | worker | consecutive failed attempts before an endpoint is disabled; `0` = never |
 | `RETENTION_PERIOD` | `2160h` (90 days) | worker | how long finished deliveries and events are kept; `0` = forever, otherwise at least `24h` |
 | `CLEANUP_INTERVAL` | `1h` | worker | how often expired data is deleted |
@@ -529,8 +546,13 @@ What the measurements showed, including the unflattering parts:
 - **The concurrency limit is shared by all endpoints.** With 10% of deliveries
   going to endpoints that take 500 ms, 10 worker slots cap throughput near 180
   deliveries/s, and at 400 offered the healthy endpoints' latency grew to
-  tens of seconds. Raising `WORKER_CONCURRENCY` to 50 fixed that load. There is
-  no per-endpoint isolation.
+  tens of seconds. Raising `WORKER_CONCURRENCY` to 50 fixed that load.
+  `WORKER_MAX_PER_ENDPOINT` (added after this measurement, default 3) now
+  isolates them: at concurrency 50, healthy endpoints stayed at p99 0.4 to
+  1.1 s while the slow ones waited their turn; at concurrency 10 it helps
+  (healthy p50 from 21 to 49 s down to 4 to 5 s in two of three runs) but 10
+  slots are simply too few for that load. See
+  [`docs/12-hiz-siniri-ve-adalet.md`](docs/12-hiz-siniri-ve-adalet.md).
 - **About one run in five was 3 to 5 times slower** than its neighbours with
   no failures or retries to explain it; I could not attribute it (the Docker
   Desktop disk layer is the likeliest cause). The worst runs are reported in
@@ -561,8 +583,16 @@ Chosen limits and gaps, so nothing here is a surprise:
   read them. Losing the key makes every stored signing secret unrecoverable
   (each endpoint would need `rotate-secret`). Upgrade api and worker
   together: a worker from before encryption cannot read encrypted secrets.
-- **No rate limiting** on the API, and no per-tenant or per-endpoint fairness:
-  one tenant sending a flood can occupy the queue.
+- **Rate limits are per api instance and in memory.** With N api instances a
+  tenant gets up to N times `RATE_LIMIT_RPS`, and a restart refills every
+  budget. Requests that fail authentication are not limited (keys are 256-bit
+  random, so guessing is not the risk; database load from bad keys is).
+- **The per-endpoint maximum is static and per worker.** It keeps a slow or
+  hanging endpoint from taking every slot, but it is not work-conserving: a
+  slow endpoint waits for its own slots even while others are idle (measured:
+  at concurrency 50 its deliveries waited about 36 s while healthy endpoints
+  stayed under 0.6 s). There is no fairness between tenants in the queue
+  itself; the API rate limit is what stops one tenant from flooding it.
 - **Idempotency keys expire with their events.** Finished data is deleted
   after `RETENTION_PERIOD` (90 days by default), and an event's idempotency
   key goes with it: after that, the same key creates a new event.
@@ -602,6 +632,7 @@ tried and what the tests found.
 | [`docs/09-saklama-suresi.md`](docs/09-saklama-suresi.md) | Retention: what is deleted, what never is, how it stays safe |
 | [`docs/10-sir-sifreleme.md`](docs/10-sir-sifreleme.md) | Encrypting the signing secrets at rest: design, migration, key replacement |
 | [`docs/11-yuk-testi.md`](docs/11-yuk-testi.md) | Load measurements: method, results, bottleneck analysis, what could not be explained |
+| [`docs/12-hiz-siniri-ve-adalet.md`](docs/12-hiz-siniri-ve-adalet.md) | Per-tenant rate limit, per-endpoint maximum, and the bugs the measurements found |
 | [`api/openapi.yaml`](api/openapi.yaml) | The API contract |
 
 ## Roadmap
@@ -620,6 +651,7 @@ tried and what the tests found.
 | 9 | Retention: expired deliveries and events are deleted | done |
 | 10 | Signing secrets encrypted at rest | done |
 | 11 | Load measurements | done |
+| 12 | Per-tenant rate limit, per-endpoint concurrency maximum | done |
 
 ## License
 

@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/burakcelik1061-star/hook-mini/api"
+	"github.com/burakcelik1061-star/hook-mini/internal/ratelimit"
 	"github.com/burakcelik1061-star/hook-mini/internal/service"
 )
 
@@ -30,6 +31,8 @@ type Deps struct {
 	// Svc backs the /v1 API. When nil only the operational endpoints are
 	// served, which keeps the health handlers testable without a database.
 	Svc *service.Service
+	// Limiter caps each tenant's request rate on /v1. Nil means no limit.
+	Limiter *ratelimit.Limiter
 }
 
 // NewRouter returns the root handler.
@@ -52,9 +55,9 @@ func NewRouter(d Deps) http.Handler {
 	r.Get("/openapi.yaml", openAPI)
 
 	if d.Svc != nil {
-		h := &handlers{svc: d.Svc, log: d.Log}
+		h := &handlers{svc: d.Svc, log: d.Log, limiter: d.Limiter}
 		r.Route("/v1", func(r chi.Router) {
-			r.Use(apiHeaders, h.authenticate)
+			r.Use(apiHeaders, h.authenticate, h.rateLimit)
 
 			r.Route("/endpoints", func(r chi.Router) {
 				r.Post("/", h.createEndpoint)

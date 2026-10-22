@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -18,6 +19,7 @@ import (
 
 	"github.com/burakcelik1061-star/hook-mini/api"
 	"github.com/burakcelik1061-star/hook-mini/internal/openapicheck"
+	"github.com/burakcelik1061-star/hook-mini/internal/ratelimit"
 	"github.com/burakcelik1061-star/hook-mini/internal/service"
 )
 
@@ -251,6 +253,9 @@ func TestHTTPResponsesMatchTheDocument(t *testing.T) {
 	// ---- 500 from every operation: the database is gone ----
 	k.fiveHundreds(t)
 
+	// ---- 429 from every operation: the tenant's budget is spent ----
+	k.tooManyRequests(t, c, svc)
+
 	// ---- the document declares nothing that never happens ----
 	k.seen[k.seen.key("GET", "/healthz", 200)] = true // covered by TestReadinessResponsesMatchTheDocument
 	k.seen[k.seen.key("GET", "/readyz", 200)] = true
@@ -268,6 +273,35 @@ func TestHTTPResponsesMatchTheDocument(t *testing.T) {
 	sort.Strings(missing)
 	if len(missing) > 0 {
 		t.Errorf("api/openapi.yaml declares responses that no test ever produced (documented but never seen):\n  %s", strings.Join(missing, "\n  "))
+	}
+}
+
+// tooManyRequests sends a request to every /v1 operation for a tenant whose
+// request budget is spent and checks the 429 each one declares, with the
+// headers that tell the client when to come back.
+func (k *contract) tooManyRequests(t *testing.T, c *tenantClient, svc *service.Service) {
+	t.Helper()
+	// One token, refilled about once a week: after the first request, the
+	// tenant is out of budget for the rest of the test.
+	limiter := ratelimit.New(1.0/(7*24*3600), 1, nil)
+	srv := httptest.NewServer(NewRouter(Deps{Log: testLog, DB: testPool, Svc: svc, Limiter: limiter}))
+	defer srv.Close()
+
+	if res := rawSend(t, srv, "GET", "/v1/endpoints", c.key, nil); res.StatusCode != http.StatusOK {
+		t.Fatalf("the request that spends the budget: %d %s", res.StatusCode, res.Body)
+	}
+	for _, op := range k.spec.Operations() {
+		if !strings.HasPrefix(op.Path, "/v1/") {
+			continue
+		}
+		res := rawSend(t, srv, op.Method, strings.ReplaceAll(op.Path, "{id}", uuid.NewString()), c.key, nil)
+		k.verify(op.Method, op.Path, http.StatusTooManyRequests, res)
+		if n, err := strconv.Atoi(res.Header.Get("Retry-After")); err != nil || n < 1 {
+			t.Errorf("%s: Retry-After = %q, want a whole number of seconds >= 1", op, res.Header.Get("Retry-After"))
+		}
+		if res.Header.Get("RateLimit-Remaining") != "0" || res.Header.Get("RateLimit-Limit") != "1" {
+			t.Errorf("%s: RateLimit-Limit/Remaining = %q/%q, want 1/0", op, res.Header.Get("RateLimit-Limit"), res.Header.Get("RateLimit-Remaining"))
+		}
 	}
 }
 
