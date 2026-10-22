@@ -142,7 +142,12 @@ Bu yüzden adımları aynı imajlarla yerelde koşturdum:
 
 Kanıtlanmayan: GitHub'ın kendine özgü kısımları (`setup-go`/`setup-node`
 önbelleği, servis konteynerine `127.0.0.1` port eşlemesiyle erişim; provada
-ağ adıyla eriştim). İlk gerçek koşu yayından sonra.
+ağ adıyla eriştim).
+
+**GitHub'daki ilk koşu (2026-10-22):** depo private olarak gönderildi; ilk
+çalışmada (run 39829101092) go, web ve image işlerinin üçü de ilk denemede
+geçti. Yerel prova, GitHub'a özgü kısımlar dışında iş akışını doğru
+öngörmüştü.
 
 ## Ekran görüntüleri
 
@@ -174,6 +179,5 @@ Görüntülerde anahtarın yalnızca açık ön eki (`hm_b64e4175…`) görünü
 
 ## Kalan
 
-Yayın: depoyu GitHub'a göndermek (önce `gh auth refresh -h github.com -s
-workflow`), CI'ın ilk gerçek koşusunu izlemek, deponun herkese açık olup
-olmayacağına karar vermek. Bunların hepsi kullanıcının açık onayıyla.
+Depo private olarak gönderildi ve CI yeşil. Deponun herkese açık olup
+olmayacağı kullanıcının kararı.

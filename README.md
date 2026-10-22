@@ -1,5 +1,7 @@
 # Hook Mini
 
+[![ci](https://github.com/burakcelik1061-star/hook-mini/actions/workflows/ci.yml/badge.svg)](https://github.com/burakcelik1061-star/hook-mini/actions/workflows/ci.yml)
+
 A small webhook delivery service: applications send events, Hook Mini delivers
 them to subscriber endpoints with signed requests, retries and a delivery
 history. Think Svix, scaled down to something you can read in an afternoon.
@@ -18,9 +20,9 @@ history. Think Svix, scaled down to something you can read in an afternoon.
 ![The web console's overview: delivery counts and the live pipeline, with deliveries flying from the Postgres queue to four endpoints](docs/screenshots/overview.png)
 
 > **Status: complete (14 phases).** Everything described here exists and is
-> tested, and a final review has been done (see [`docs/14-son-inceleme-2.md`](docs/14-son-inceleme-2.md)). The CI
-> workflow passes in clean Linux containers but has not run on GitHub yet
-> (see [Known limits](#known-limits)).
+> tested, and a final review has been done (see [`docs/14-son-inceleme-2.md`](docs/14-son-inceleme-2.md)). CI runs the
+> formatting, vet, generated-code, race-detector, console and Docker image
+> checks on every push.
 
 **Contents:**
 [Quick start](#quick-start) ·
@@ -707,10 +709,9 @@ Chosen limits and gaps, so nothing here is a surprise:
   content policy above is what makes that an acceptable opt-in.
 - **A tenant can tell whether a host name resolves** and to what kind of
   address (`blocked: ... (private network)`), though never the address itself.
-- **Platform**: developed and tested on Windows with Docker. Every step of the
-  CI workflow passes in clean Linux containers (the same `golang`, `node` and
-  `postgres` images, from a checkout without build output), and `actionlint`
-  finds nothing, but **the workflow has not run on GitHub yet**.
+- **Platform**: developed on Windows with Docker; CI runs on Linux (GitHub
+  Actions, `ubuntu-latest`), where the race detector and the database tests
+  run against a real Postgres. Other platforms are not tested.
 
 ## Documentation
 
@@ -733,7 +734,7 @@ tried and what the tests found.
 | [`docs/11-yuk-testi.md`](docs/11-yuk-testi.md) | Load measurements: method, results, bottleneck analysis, what could not be explained |
 | [`docs/12-hiz-siniri-ve-adalet.md`](docs/12-hiz-siniri-ve-adalet.md) | Per-tenant rate limit, per-endpoint maximum, and the bugs the measurements found |
 | [`docs/13-arayuz.md`](docs/13-arayuz.md) | The web console: design, security, how it is served and tested, what the browser test found |
-| [`docs/14-son-inceleme-2.md`](docs/14-son-inceleme-2.md) | Second final review (phases 9 to 13): five findings and their fixes, the CI rehearsal |
+| [`docs/14-son-inceleme-2.md`](docs/14-son-inceleme-2.md) | Second final review (phases 9 to 13): five findings and their fixes, the CI rehearsal and the first GitHub run |
 | [`api/openapi.yaml`](api/openapi.yaml) | The API contract |
 
 ## Roadmap
@@ -754,7 +755,7 @@ tried and what the tests found.
 | 11 | Load measurements | done |
 | 12 | Per-tenant rate limit, per-endpoint concurrency maximum | done |
 | 13 | Web console and `GET /v1/stats` | done |
-| 14 | Final review, CI rehearsal, screenshots | done |
+| 14 | Final review, CI on GitHub, screenshots | done |
 
 ## License
 
