@@ -27,6 +27,7 @@ import (
 	"github.com/burakcelik1061-star/hook-mini/internal/database"
 	"github.com/burakcelik1061-star/hook-mini/internal/openapicheck"
 	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
+	"github.com/burakcelik1061-star/hook-mini/internal/secretbox"
 	"github.com/burakcelik1061-star/hook-mini/internal/secretbox/secretboxtest"
 	"github.com/burakcelik1061-star/hook-mini/internal/service"
 	"github.com/burakcelik1061-star/hook-mini/internal/store"
@@ -1171,8 +1172,8 @@ func TestDeliveredRequestsVerifyWithTheEndpointSecret(t *testing.T) {
 // A stored secret that does not open (damaged, or copied from another
 // endpoint: sealed values are bound to their endpoint) is never used and
 // never guessed around: the delivery is abandoned with the reason, and no
-// request goes out. The startup check rules out a missing key, so only such a
-// value can get here.
+// request goes out. (A secret sealed with a key the worker lacks is a
+// different case: see TestSecretSealedWithAnUnknownKeyIsPostponed.)
 func TestUndecryptableSecretAbandonsTheDelivery(t *testing.T) {
 	f := newFixture(t)
 	srv, rec := newRecorder(t, nil)
@@ -1202,6 +1203,98 @@ func TestUndecryptableSecretAbandonsTheDelivery(t *testing.T) {
 		t.Errorf("%d requests went out with a secret that did not open", n)
 	}
 	f.assertInvariant()
+}
+
+// During a key change an api that already has the new key seals secrets with
+// it while a worker that does not have it yet is still running. That worker
+// must not kill the deliveries (nor spend their retries, nor send anything):
+// it hands them back for later, and a worker with the key delivers them.
+func TestSecretSealedWithAnUnknownKeyIsPostponed(t *testing.T) {
+	f := newFixture(t)
+	srv, rec := newRecorder(t, nil)
+	f.endpoint(srv.URL) // sealed with the fixture's key
+	f.events(1)
+
+	raw, err := secretbox.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, err := secretbox.ParseKeys(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig("w-without-the-key")
+	cfg.Keys = stale // a different key only
+	d := f.runUntilPostponed(cfg, rec)
+
+	// A worker with the key delivers it as usual.
+	f.dueNow(d)
+	f.start(testConfig("w-with-the-key"))
+	f.waitStatus(5*time.Second, "succeeded", 1)
+	if n := rec.count(); n != 1 {
+		t.Errorf("%d requests, want 1", n)
+	}
+	f.assertInvariant()
+}
+
+// The same for a secret stored unencrypted, as a binary from before
+// encryption could write during an upgrade: postponed, and delivered once
+// migrate has encrypted it.
+func TestUnencryptedSecretIsPostponedUntilMigrated(t *testing.T) {
+	f := newFixture(t)
+	srv, rec := newRecorder(t, nil)
+	ep, plain := f.endpointWithSecret(srv.URL)
+	if _, err := testPool.Exec(f.ctx, `UPDATE endpoints SET secret = $2 WHERE id = $1`, ep, plain); err != nil {
+		t.Fatal(err)
+	}
+	f.events(1)
+	d := f.runUntilPostponed(testConfig("w-plaintext"), rec)
+
+	if _, err := f.svc.ReencryptSecrets(f.ctx); err != nil { // what migrate runs
+		t.Fatal(err)
+	}
+	f.dueNow(d)
+	f.start(testConfig("w-after-migrate"))
+	f.waitStatus(5*time.Second, "succeeded", 1)
+	f.assertInvariant()
+}
+
+// runUntilPostponed runs a worker until it hands the fixture's only delivery
+// back without an attempt, stops it, and checks how it was handed back.
+func (f *fixture) runUntilPostponed(cfg Config, rec *recorder) store.Delivery {
+	f.t.Helper()
+	stop := f.start(cfg)
+	f.waitFor(5*time.Second, "the delivery to be handed back", func() bool {
+		d := f.only()
+		return d.Status == "pending" && d.LastError != nil
+	})
+	stop()
+
+	d := f.only()
+	if d.AttemptCount != 0 || len(f.attempts(d.ID)) != 0 {
+		f.t.Errorf("attempt_count %d, %d attempt rows; want none: nothing was sent", d.AttemptCount, len(f.attempts(d.ID)))
+	}
+	if wait := time.Until(d.NextAttemptAt); wait < 30*time.Second {
+		f.t.Errorf("due again in %v; a worker without the key would claim it again at once", wait)
+	}
+	if !strings.Contains(*d.LastError, "delayed without an attempt") || strings.Contains(*d.LastError, "enc:v1") || strings.Contains(*d.LastError, "whsec_") {
+		f.t.Errorf("last_error = %q, want the tenant-facing reason and no key material", *d.LastError)
+	}
+	if n := rec.count(); n != 0 {
+		f.t.Errorf("%d requests went out", n)
+	}
+	if !strings.Contains(f.logs.String(), "delivery postponed") {
+		f.t.Error("the worker did not log why it postponed the delivery")
+	}
+	return d
+}
+
+// dueNow makes a postponed delivery due at once, instead of waiting it out.
+func (f *fixture) dueNow(d store.Delivery) {
+	f.t.Helper()
+	if _, err := testPool.Exec(f.ctx, `UPDATE deliveries SET next_attempt_at = now() WHERE id = $1`, d.ID); err != nil {
+		f.t.Fatal(err)
+	}
 }
 
 func TestSecretRotationOverlapsThenEnds(t *testing.T) {

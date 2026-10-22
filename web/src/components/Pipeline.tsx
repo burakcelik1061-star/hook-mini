@@ -36,6 +36,14 @@ export function Pipeline({ endpoints, recent }: { endpoints: Stats['endpoints'];
   const [packets, setPackets] = useState<Packet[]>([]);
   const prev = useRef<Map<string, Delivery> | null>(null);
   const seq = useRef(0);
+  // Each batch of packets is removed by its own timer. They are not cleared
+  // when the next poll arrives (every 2 s, sooner than a packet's 6.5 s), only
+  // when the scene goes away.
+  const timers = useRef(new Set<ReturnType<typeof setTimeout>>());
+  useEffect(() => {
+    const all = timers.current;
+    return () => all.forEach(clearTimeout);
+  }, []);
 
   const lanes = [...endpoints].sort((a, b) => (a.status === b.status ? 0 : a.status === 'active' ? -1 : 1)).slice(0, MAX_LANES);
   const laneIds = new Set(lanes.map((l) => l.id));
@@ -57,8 +65,11 @@ export function Pipeline({ endpoints, recent }: { endpoints: Stats['endpoints'];
       }).reverse();
     });
     const keys = new Set(added.map((a) => a.key));
-    const t = setTimeout(() => setPackets((p) => p.filter((x) => !keys.has(x.key))), 6500);
-    return () => clearTimeout(t);
+    const t = setTimeout(() => {
+      timers.current.delete(t);
+      setPackets((p) => p.filter((x) => !keys.has(x.key)));
+    }, 6500);
+    timers.current.add(t);
     // laneIds is derived from endpoints, which the parent refreshes with recent
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recent]);

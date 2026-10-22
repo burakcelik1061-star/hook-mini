@@ -244,6 +244,43 @@ func (q *Queries) MarkDeliverySucceeded(ctx context.Context, arg MarkDeliverySuc
 	return result.RowsAffected(), nil
 }
 
+const postponeDelivery = `-- name: PostponeDelivery :execrows
+UPDATE deliveries
+SET status          = 'pending',
+    next_attempt_at = now() + $1::bigint * interval '1 millisecond',
+    locked_until    = NULL,
+    locked_by       = NULL,
+    lease_token     = NULL,
+    last_error      = $2::text
+WHERE id = $3 AND lease_token = $4::uuid AND status = 'in_flight'
+`
+
+type PostponeDeliveryParams struct {
+	DelayMs    int64
+	LastError  string
+	ID         uuid.UUID
+	LeaseToken uuid.UUID
+}
+
+// Hands back a claimed delivery without attempting it, due again after
+// delay_ms. For when this worker cannot sign the request because of its own
+// configuration (the endpoint's secret is sealed with an encryption key it
+// does not have yet, as during a key change): nothing was sent, so no attempt
+// is recorded and no retry is used up, and the delivery must not die for a
+// problem a configuration change fixes.
+func (q *Queries) PostponeDelivery(ctx context.Context, arg PostponeDeliveryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, postponeDelivery,
+		arg.DelayMs,
+		arg.LastError,
+		arg.ID,
+		arg.LeaseToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const reclaimExpiredLeases = `-- name: ReclaimExpiredLeases :many
 WITH expired AS MATERIALIZED (
     SELECT id, locked_by

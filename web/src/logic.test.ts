@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { API_KEY_PATTERN, createKeyStore, keyHint, type StorageLike } from './auth';
+import { API_KEY_PATTERN, createKeyStore, keyHint, storageOrMemory, type StorageLike } from './auth';
 import { layout } from './components/FanOut';
 import { changes } from './components/Pipeline';
 import { attemptKind, count, duration, percent, relativeTime, successRate, target } from './format';
@@ -51,6 +51,23 @@ describe('the key store', () => {
     for (const bad of ['', 'hm_0123abcd', KEY + 'a', KEY.toUpperCase(), ' ' + KEY, 'hm_0123abcg_' + 'b'.repeat(64)]) {
       expect(API_KEY_PATTERN.test(bad)).toBe(false);
     }
+  });
+
+  it('still works when the browser refuses storage', () => {
+    const blocked = () => {
+      throw new DOMException('The operation is insecure.', 'SecurityError');
+    };
+    const full: StorageLike = { getItem: () => null, setItem: () => { throw new DOMException('quota', 'QuotaExceededError'); }, removeItem: () => {} };
+    for (const get of [blocked, () => full]) {
+      const s = createKeyStore(storageOrMemory(get), storageOrMemory(get));
+      s.set(KEY, false);
+      expect(s.get()).toBe(KEY);
+      s.clear();
+      expect(s.get()).toBeNull();
+    }
+    const real = memory();
+    expect(storageOrMemory(() => real)).toBe(real); // a working storage is used as it is
+    expect(real.data.size).toBe(0); // and the probe leaves nothing behind
   });
 
   it('shows only a prefix of the key', () => {

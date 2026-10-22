@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -102,9 +103,101 @@ WHERE id = (SELECT id FROM deliveries WHERE tenant_id = (SELECT id FROM tenants 
 }
 
 type planNode struct {
-	Type  string     `json:"Node Type"`
-	Loops float64    `json:"Actual Loops"`
-	Plans []planNode `json:"Plans"`
+	Type      string     `json:"Node Type"`
+	Relation  string     `json:"Relation Name"`
+	Index     string     `json:"Index Name"`
+	IndexCond string     `json:"Index Cond"`
+	Loops     float64    `json:"Actual Loops"`
+	Plans     []planNode `json:"Plans"`
+}
+
+// TestStatsQueriesUseBoundedIndexes keeps the console's statistics cheap for
+// a tenant with a long history: GET /v1/stats is polled every few seconds by
+// every open console. The 24-hour figures must reach deliveries through an
+// index bounded by created_at, and the backlog through the partial indexes
+// of unfinished deliveries, never by walking every delivery of the tenant.
+func TestStatsQueriesUseBoundedIndexes(t *testing.T) {
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	// With sequential scans off, a table scan only appears when no index can
+	// serve the query at all; the choice between indexes is what is tested.
+	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
+		t.Fatal(err)
+	}
+
+	tenant := uuid.New()
+	for _, q := range []struct {
+		name, sql string
+		// check judges every index scan on deliveries.
+		check func(n planNode) string
+		// want lists indexes on deliveries the plan must use.
+		want []string
+	}{
+		{"DeliveryBacklog", deliveryBacklog, func(n planNode) string {
+			if n.Index != "deliveries_due_idx" && n.Index != "deliveries_lease_idx" {
+				return "reads " + n.Index + ", not only the unfinished deliveries"
+			}
+			return ""
+		}, []string{"deliveries_due_idx", "deliveries_lease_idx"}},
+		{"DeliveryCountsLast24h", deliveryCountsLast24h, boundedByCreatedAt, nil},
+		{"EndpointStatsLast24h", endpointStatsLast24h, boundedByCreatedAt, nil},
+	} {
+		t.Run(q.name, func(t *testing.T) {
+			var raw []byte
+			if err := tx.QueryRow(ctx, "EXPLAIN (FORMAT JSON) "+q.sql, tenant).Scan(&raw); err != nil {
+				t.Fatalf("explain: %v", err)
+			}
+			var plans []struct {
+				Plan planNode `json:"Plan"`
+			}
+			if err := json.Unmarshal(raw, &plans); err != nil || len(plans) != 1 {
+				t.Fatalf("unexpected EXPLAIN output: %v", err)
+			}
+			used := map[string]bool{}
+			plans[0].Plan.walk(func(n planNode) {
+				if n.Type == "Seq Scan" && n.Relation == "deliveries" {
+					t.Errorf("scans the whole deliveries table")
+				}
+				if !strings.HasPrefix(n.Index, "deliveries_") {
+					return
+				}
+				used[n.Index] = true
+				if problem := q.check(n); problem != "" {
+					t.Errorf("%s (%s, condition %q)", problem, n.Type, n.IndexCond)
+				}
+			})
+			if len(used) == 0 {
+				t.Error("does not read deliveries through any index")
+			}
+			for _, idx := range q.want {
+				if !used[idx] {
+					t.Errorf("does not use %s", idx)
+				}
+			}
+		})
+	}
+}
+
+// boundedByCreatedAt accepts an index scan on deliveries only if its
+// condition limits created_at, which is what keeps it to the last 24 hours.
+func boundedByCreatedAt(n planNode) string {
+	if !strings.Contains(n.IndexCond, "created_at >=") {
+		return "reads " + n.Index + " without a created_at bound"
+	}
+	return ""
 }
 
 func (n planNode) walk(fn func(planNode)) {

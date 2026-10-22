@@ -42,6 +42,25 @@ export function createKeyStore(session: StorageLike, local: StorageLike): KeySto
   };
 }
 
+/**
+ * The storage get returns, or one in memory if the browser refuses it
+ * (storage blocked by the user or a policy, where merely reading
+ * window.localStorage throws, or a full or read-only storage). In memory the
+ * key lasts until the page is reloaded, which beats a console that cannot load.
+ */
+export function storageOrMemory(get: () => StorageLike): StorageLike {
+  try {
+    const s = get();
+    const probe = 'hookmini.probe';
+    s.setItem(probe, probe);
+    s.removeItem(probe);
+    return s;
+  } catch {
+    const data = new Map<string, string>();
+    return { getItem: (k) => data.get(k) ?? null, setItem: (k, v) => void data.set(k, v), removeItem: (k) => void data.delete(k) };
+  }
+}
+
 /** The prefix shown in the header: enough to tell keys apart, not to use one. */
 export function keyHint(key: string | null): string {
   if (!key) return '';

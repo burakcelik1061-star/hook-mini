@@ -38,12 +38,6 @@ export function usePath(): Path {
   return path;
 }
 
-export function useQuery(name: string): string | null {
-  const path = usePath();
-  void path; // re-read on navigation
-  return new URLSearchParams(window.location.search).get(name);
-}
-
 type LinkProps = Omit<AnchorHTMLAttributes<HTMLAnchorElement>, 'href'> & { to: Path; query?: string };
 
 /** An <a> that navigates without a reload; modified clicks keep their meaning. */

@@ -30,9 +30,15 @@ const (
 	maxErrorBackoff = 10 * time.Second
 	// reapBatch is how many expired leases one reaper pass reclaims at most.
 	reapBatch = 100
+	// keyMismatchDelay is how long a delivery waits when this worker cannot
+	// open its endpoint's secret for a configuration reason (see process).
+	keyMismatchDelay = time.Minute
 
 	lostLeaseReason        = "lease expired: the worker stopped before reporting a result"
 	disabledEndpointReason = "endpoint is disabled; delivery abandoned without an attempt"
+	// Shown to the tenant, so it says what happens, not how the service is
+	// configured; the worker's log has the detail.
+	keyMismatchReason = "delayed without an attempt: Hook Mini could not sign the request yet (a configuration change in progress); it will be tried again"
 )
 
 // errLeaseLost means the delivery is no longer leased to this attempt: the
@@ -384,9 +390,20 @@ func (w *Worker) process(ctx context.Context, job store.ClaimDueDeliveriesRow) {
 	}
 
 	secrets, err := w.openSecrets(job)
+	if errors.Is(err, secretbox.ErrUnknownKey) || errors.Is(err, secretbox.ErrNotSealed) {
+		// This worker's keys and the database disagree: the secret was sealed
+		// with a key it does not have, or stored unencrypted. The startup
+		// check rules that out for what was stored before this worker
+		// started, but not for what an api with newer keys (or an older
+		// binary, during an upgrade) writes while it runs. A configuration
+		// change fixes it, so the delivery waits rather than dies.
+		w.postpone(log, job, keyMismatchDelay, keyMismatchReason, err)
+		return
+	}
 	if err != nil {
-		// The startup check guarantees every key is configured, so this is a
-		// damaged or tampered value; the error names neither key nor secret.
+		// A damaged or tampered value, or one copied from another endpoint:
+		// no configuration change will open it. The error names neither key
+		// nor secret.
 		w.abandon(log, job, "the endpoint's signing secret cannot be decrypted: "+err.Error())
 		return
 	}
@@ -597,6 +614,28 @@ func (w *Worker) abandon(log *slog.Logger, job store.ClaimDueDeliveriesRow, reas
 		log.Warn("delivery not abandoned: the lease was lost", "reason", reason)
 	default:
 		log.Warn("delivery abandoned", "reason", reason)
+	}
+}
+
+// postpone gives a claimed delivery back to the queue, due again after
+// delay, without an attempt: nothing was sent.
+func (w *Worker) postpone(log *slog.Logger, job store.ClaimDueDeliveriesRow, delay time.Duration, reason string, cause error) {
+	ctx, cancel := context.WithTimeout(context.Background(), recordTimeout)
+	defer cancel()
+	n, err := w.q.PostponeDelivery(ctx, store.PostponeDeliveryParams{
+		ID: job.ID, LeaseToken: job.LeaseToken, DelayMs: delay.Milliseconds(), LastError: reason,
+	})
+	switch {
+	case err != nil:
+		log.Error("postponing the delivery failed", "error", err)
+	case n == 0:
+		log.Warn("delivery not postponed: the lease was lost")
+	default:
+		// An error, not a warning: deliveries wait until an operator gives
+		// this worker every key in use (SECRET_ENCRYPTION_KEYS) or runs
+		// migrate.
+		log.Error("cannot open the endpoint's signing secret with this worker's encryption keys; delivery postponed",
+			"cause", cause, "retry_in", delay)
 	}
 }
 

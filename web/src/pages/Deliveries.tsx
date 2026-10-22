@@ -42,6 +42,19 @@ export function Deliveries() {
     [status, endpoint],
   );
 
+  // A link can change the query while this page stays on screen (the menu's
+  // "Deliveries" from a filtered view, or back and forward): follow it, so
+  // the view always matches the address.
+  useEffect(() => {
+    const follow = () => {
+      const q = fromQuery();
+      setStatus(q.status);
+      setEndpoint(q.endpoint);
+    };
+    window.addEventListener('popstate', follow);
+    return () => window.removeEventListener('popstate', follow);
+  }, []);
+
   // A new filter starts over.
   useEffect(() => {
     setMore({ rows: [], cursor: null });

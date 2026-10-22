@@ -103,11 +103,18 @@ type Querier interface {
 	DeleteExpiredEvents(ctx context.Context, arg DeleteExpiredEventsParams) (int64, error)
 	// Cascades to keys, endpoints, events, deliveries and attempts.
 	DeleteTenant(ctx context.Context, id uuid.UUID) (int64, error)
-	// Unfinished deliveries, however old.
+	// Unfinished deliveries, however old. One count per status, so each can use
+	// that status's partial index (deliveries_due_idx, deliveries_lease_idx):
+	// "status IN ('pending', 'in_flight')" implies neither index's predicate, and
+	// the planner would walk the tenant's whole history instead (every delivery
+	// of the retention period) to find the few that are unfinished. The partial
+	// indexes hold every tenant's unfinished deliveries, which is the queue and
+	// stays small while the workers keep up.
 	DeliveryBacklog(ctx context.Context, tenantID uuid.UUID) (DeliveryBacklogRow, error)
 	// Tenant statistics for the console's overview. Each query is scoped to one
-	// tenant and bounded: the 24-hour figures use deliveries_tenant_idx
-	// (tenant_id, created_at), the backlog only looks at unfinished deliveries.
+	// tenant and bounded: the 24-hour figures use deliveries_tenant_idx and
+	// deliveries_endpoint_idx with a created_at range, the backlog reads only the
+	// unfinished deliveries (see TestStatsQueriesUseBoundedIndexes).
 	// Deliveries created in the last 24 hours, by their status now.
 	DeliveryCountsLast24h(ctx context.Context, tenantID uuid.UUID) ([]DeliveryCountsLast24hRow, error)
 	// Idempotent: only an active endpoint is changed, so the first reason sticks.
@@ -158,6 +165,13 @@ type Querier interface {
 	// many rows it changed. 0 means the lease was lost (expired and reclaimed,
 	// or the delivery was deleted) and the caller must discard its result.
 	MarkDeliverySucceeded(ctx context.Context, arg MarkDeliverySucceededParams) (int64, error)
+	// Hands back a claimed delivery without attempting it, due again after
+	// delay_ms. For when this worker cannot sign the request because of its own
+	// configuration (the endpoint's secret is sealed with an encryption key it
+	// does not have yet, as during a key change): nothing was sent, so no attempt
+	// is recorded and no retry is used up, and the delivery must not die for a
+	// problem a configuration change fixes.
+	PostponeDelivery(ctx context.Context, arg PostponeDeliveryParams) (int64, error)
 	// Returns deliveries whose worker vanished (crashed, was killed, lost its
 	// network) to the queue. The lost attempt counts: the request may well have
 	// reached the endpoint, and counting it is what stops a delivery that crashes

@@ -15,9 +15,12 @@ history. Think Svix, scaled down to something you can read in an afternoon.
 - **A web console** in the same binary: watch deliveries move live, inspect
   every attempt, replay, manage endpoints and send test events.
 
-> **Status: Phase 13 of 14 (web console).** Everything described here exists and
-> is tested; the final review and publishing (Phase 14) are still to do, and CI
-> has not run yet (see [Known limits](#known-limits)).
+![The web console's overview: delivery counts and the live pipeline, with deliveries flying from the Postgres queue to four endpoints](docs/screenshots/overview.png)
+
+> **Status: complete (14 phases).** Everything described here exists and is
+> tested, and a final review has been done (see [`docs/14-son-inceleme-2.md`](docs/14-son-inceleme-2.md)). The CI
+> workflow passes in clean Linux containers but has not run on GitHub yet
+> (see [Known limits](#known-limits)).
 
 **Contents:**
 [Quick start](#quick-start) ·
@@ -170,6 +173,17 @@ The api serves a console at `/`: a React and TypeScript single-page app in
 [`web/`](web), built by Vite and embedded into the api binary with `go:embed`,
 so there is nothing extra to deploy. It uses only the public `/v1` API with
 the tenant's key, exactly as any client would.
+
+<table>
+<tr>
+<td width="50%"><img src="docs/screenshots/deliveries.png" alt="Deliveries: dead deliveries filtered, with one delivery's three failed attempts in a timeline"></td>
+<td width="50%"><img src="docs/screenshots/send-event.png" alt="Send event: the 201 response, the fan-out to four endpoints and each delivery's result"></td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/screenshots/endpoints.png" alt="Endpoints: each with its success rate, failures in a row and actions"></td>
+<td width="50%"><img src="docs/screenshots/sign-in.png" alt="Sign in with a tenant API key"></td>
+</tr>
+</table>
 
 | Screen | What it does |
 | --- | --- |
@@ -505,14 +519,22 @@ Every stored secret carries the id of the key that sealed it, and several keys
 can be configured at once (the first one seals, all of them open), so the key
 can be replaced without downtime:
 
-1. Put the new key first: `SECRET_ENCRYPTION_KEYS=<new>,<old>`, and restart.
-2. Run `migrate` (`docker compose up -d migrate`): it re-encrypts every secret
+1. Add the new key **after** the current one,
+   `SECRET_ENCRYPTION_KEYS=<old>,<new>`, and restart every api and worker.
+   Each can now open what either key seals; all still seal with the old one.
+2. Put the new key first, `<new>,<old>`, and restart. Step 1 is what makes
+   this safe while instances restart one by one: whichever instance seals
+   with the new key first, every other one can already open it.
+3. Run `migrate` (`docker compose up -d migrate`): it re-encrypts every secret
    with the new key. It is idempotent and safe while the api is serving.
-3. Remove the old key and restart.
+4. Remove the old key and restart.
 
 Removing a key too early is caught at startup: the api and the worker refuse
 to run while any secret is sealed with a key they do not have, or stored in
-plaintext, and say which and how many.
+plaintext, and say which and how many. If a running worker meets such a
+secret anyway (step 1 skipped, or an older binary writing plaintext during an
+upgrade), it does not fail the delivery: it hands it back without an attempt,
+retries a minute later and logs an error until it has the key.
 
 Scale delivery by running more workers (`docker compose up -d --scale worker=3`).
 Stopping a worker (`SIGTERM`) is safe at any time; killing one (`SIGKILL`) is
@@ -568,7 +590,7 @@ cd web && npm ci && npm run typecheck && npm test
 | **Contention** | `internal/delivery/stress_test.go` | 16 concurrent claimers over 400 deliveries: each handed out exactly once, each with its own lease; 8 concurrent reapers reclaim each expired lease once. |
 | **Fuzzing** | `*/fuzz_test.go` | Validators agree with Postgres (bad input is a `400`, never a `500`); the SSRF policy is consistent across IPv4/IPv6 encodings; signatures round-trip and any tampering is detected; parsers never panic. |
 | **Load measurement** | `cmd/loadtest` | Not a test: measures ingestion, delivery latency and throughput against the running stack and checks each run against the database (see [Performance](#performance)). |
-| **Plan test** | `internal/store/plan_test.go` | The claim query takes its locks exactly once (`EXPLAIN ANALYZE`). |
+| **Plan tests** | `internal/store/plan_test.go` | The claim query takes its locks exactly once (`EXPLAIN ANALYZE`); the console's statistics, polled every few seconds, read only bounded index ranges, never a tenant's whole history. |
 | **Mutation checks** | run by hand | Each safety property was removed from the code (or the OpenAPI document was made wrong) to confirm a test fails. Results are in `docs/`. |
 
 Fuzzing runs as ordinary unit tests over the seed inputs; to fuzz for real
@@ -685,9 +707,10 @@ Chosen limits and gaps, so nothing here is a surprise:
   content policy above is what makes that an acceptable opt-in.
 - **A tenant can tell whether a host name resolves** and to what kind of
   address (`blocked: ... (private network)`), though never the address itself.
-- **Platform**: developed and tested on Windows with Docker; **CI has not run
-  yet** (the repository has not been pushed), so the workflow file is
-  unverified.
+- **Platform**: developed and tested on Windows with Docker. Every step of the
+  CI workflow passes in clean Linux containers (the same `golang`, `node` and
+  `postgres` images, from a checkout without build output), and `actionlint`
+  finds nothing, but **the workflow has not run on GitHub yet**.
 
 ## Documentation
 
@@ -710,6 +733,7 @@ tried and what the tests found.
 | [`docs/11-yuk-testi.md`](docs/11-yuk-testi.md) | Load measurements: method, results, bottleneck analysis, what could not be explained |
 | [`docs/12-hiz-siniri-ve-adalet.md`](docs/12-hiz-siniri-ve-adalet.md) | Per-tenant rate limit, per-endpoint maximum, and the bugs the measurements found |
 | [`docs/13-arayuz.md`](docs/13-arayuz.md) | The web console: design, security, how it is served and tested, what the browser test found |
+| [`docs/14-son-inceleme-2.md`](docs/14-son-inceleme-2.md) | Second final review (phases 9 to 13): five findings and their fixes, the CI rehearsal |
 | [`api/openapi.yaml`](api/openapi.yaml) | The API contract |
 
 ## Roadmap
@@ -730,7 +754,7 @@ tried and what the tests found.
 | 11 | Load measurements | done |
 | 12 | Per-tenant rate limit, per-endpoint concurrency maximum | done |
 | 13 | Web console and `GET /v1/stats` | done |
-| 14 | Final review, screenshots, CI run, publishing | next |
+| 14 | Final review, CI rehearsal, screenshots | done |
 
 ## License
 

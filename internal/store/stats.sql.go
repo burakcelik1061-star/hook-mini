@@ -12,10 +12,8 @@ import (
 )
 
 const deliveryBacklog = `-- name: DeliveryBacklog :one
-SELECT count(*) FILTER (WHERE status = 'pending')::bigint   AS pending,
-       count(*) FILTER (WHERE status = 'in_flight')::bigint AS in_flight
-FROM deliveries
-WHERE tenant_id = $1 AND status IN ('pending', 'in_flight')
+SELECT (SELECT count(*) FROM deliveries p WHERE p.status = 'pending' AND p.tenant_id = $1)::bigint     AS pending,
+       (SELECT count(*) FROM deliveries f WHERE f.status = 'in_flight' AND f.tenant_id = $1)::bigint AS in_flight
 `
 
 type DeliveryBacklogRow struct {
@@ -23,7 +21,13 @@ type DeliveryBacklogRow struct {
 	InFlight int64
 }
 
-// Unfinished deliveries, however old.
+// Unfinished deliveries, however old. One count per status, so each can use
+// that status's partial index (deliveries_due_idx, deliveries_lease_idx):
+// "status IN ('pending', 'in_flight')" implies neither index's predicate, and
+// the planner would walk the tenant's whole history instead (every delivery
+// of the retention period) to find the few that are unfinished. The partial
+// indexes hold every tenant's unfinished deliveries, which is the queue and
+// stays small while the workers keep up.
 func (q *Queries) DeliveryBacklog(ctx context.Context, tenantID uuid.UUID) (DeliveryBacklogRow, error) {
 	row := q.db.QueryRow(ctx, deliveryBacklog, tenantID)
 	var i DeliveryBacklogRow
@@ -45,8 +49,9 @@ type DeliveryCountsLast24hRow struct {
 }
 
 // Tenant statistics for the console's overview. Each query is scoped to one
-// tenant and bounded: the 24-hour figures use deliveries_tenant_idx
-// (tenant_id, created_at), the backlog only looks at unfinished deliveries.
+// tenant and bounded: the 24-hour figures use deliveries_tenant_idx and
+// deliveries_endpoint_idx with a created_at range, the backlog reads only the
+// unfinished deliveries (see TestStatsQueriesUseBoundedIndexes).
 // Deliveries created in the last 24 hours, by their status now.
 func (q *Queries) DeliveryCountsLast24h(ctx context.Context, tenantID uuid.UUID) ([]DeliveryCountsLast24hRow, error) {
 	rows, err := q.db.Query(ctx, deliveryCountsLast24h, tenantID)

@@ -150,6 +150,22 @@ SET status           = 'pending',
     last_error       = sqlc.arg(last_error)::text
 WHERE id = sqlc.arg(id) AND lease_token = sqlc.arg(lease_token)::uuid AND status = 'in_flight';
 
+-- name: PostponeDelivery :execrows
+-- Hands back a claimed delivery without attempting it, due again after
+-- delay_ms. For when this worker cannot sign the request because of its own
+-- configuration (the endpoint's secret is sealed with an encryption key it
+-- does not have yet, as during a key change): nothing was sent, so no attempt
+-- is recorded and no retry is used up, and the delivery must not die for a
+-- problem a configuration change fixes.
+UPDATE deliveries
+SET status          = 'pending',
+    next_attempt_at = now() + sqlc.arg(delay_ms)::bigint * interval '1 millisecond',
+    locked_until    = NULL,
+    locked_by       = NULL,
+    lease_token     = NULL,
+    last_error      = sqlc.arg(last_error)::text
+WHERE id = sqlc.arg(id) AND lease_token = sqlc.arg(lease_token)::uuid AND status = 'in_flight';
+
 -- name: ReclaimExpiredLeases :many
 -- Returns deliveries whose worker vanished (crashed, was killed, lost its
 -- network) to the queue. The lost attempt counts: the request may well have

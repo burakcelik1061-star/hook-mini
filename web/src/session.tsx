@@ -3,10 +3,13 @@
 
 import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from 'react';
 import { createClient, type Client, type RateLimit } from './api';
-import { createKeyStore } from './auth';
+import { createKeyStore, storageOrMemory } from './auth';
 import { navigate, paths } from './router';
 
-const store = createKeyStore(window.sessionStorage, window.localStorage);
+const store = createKeyStore(
+  storageOrMemory(() => window.sessionStorage),
+  storageOrMemory(() => window.localStorage),
+);
 
 interface Session {
   apiKey: string | null;
