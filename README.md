@@ -484,6 +484,7 @@ runs it on every push.
 | **Chaos** | `internal/delivery/chaos_test.go` | 3 workers restarted at random, "crashed" workers that claim and vanish, failing/hanging/slow/rate-limiting endpoints, producers with repeating idempotency keys, an operator replaying, toggling, rotating and deleting, all at once. Restarts interrupt attempts mid-flight. Afterwards: every delivery is final, attempt history consistent, no retry budget exceeded and no interrupted attempt counted against one, nothing crossed tenants, every request validly signed, every "succeeded" delivery really arrived. A run that did not produce each kind of event it claims to test fails. The seed is printed on failure. |
 | **Contention** | `internal/delivery/stress_test.go` | 16 concurrent claimers over 400 deliveries: each handed out exactly once, each with its own lease; 8 concurrent reapers reclaim each expired lease once. |
 | **Fuzzing** | `*/fuzz_test.go` | Validators agree with Postgres (bad input is a `400`, never a `500`); the SSRF policy is consistent across IPv4/IPv6 encodings; signatures round-trip and any tampering is detected; parsers never panic. |
+| **Load measurement** | `cmd/loadtest` | Not a test: measures ingestion, delivery latency and throughput against the running stack and checks each run against the database (see [Performance](#performance)). |
 | **Plan test** | `internal/store/plan_test.go` | The claim query takes its locks exactly once (`EXPLAIN ANALYZE`). |
 | **Mutation checks** | run by hand | Each safety property was removed from the code (or the OpenAPI document was made wrong) to confirm a test fails. Results are in `docs/`. |
 
@@ -497,6 +498,44 @@ go test -run '^$' -fuzz '^FuzzCheckConsistency$' -fuzztime 60s ./internal/safedi
 
 Inputs that once failed are kept under `testdata/fuzz/` and rerun on every
 `go test`.
+
+## Performance
+
+Measured with `cmd/loadtest`, a tool that drives the running stack through its
+public API and checks every run against the database (an inconsistent run is
+reported as invalid, never as a number). **One machine, shared CPU, Docker
+Desktop on Windows** (Ryzen 5 5600X, PostgreSQL 16 with default settings, load
+generator and webhook sink on the same host): treat these as a floor for
+this environment, not a benchmark. Medians of three runs, with the worst in
+brackets.
+
+| What | Result |
+| --- | --- |
+| Event ingestion, 1 endpoint per event | **1,800 events/s**, p99 25 ms |
+| Event ingestion, 5 endpoints per event | **1,500 events/s**, p99 31 ms |
+| Event ingestion, 20 endpoints per event | **830 events/s** (about 16,700 delivery rows/s), p99 71 ms |
+| Submit-to-delivered latency at 250 to 500 deliveries/s, default worker | p50 **262 ms**, p99 **about 505 ms** |
+| Delivery throughput, one worker, default settings | **about 700 deliveries/s** (burst of 25,000) |
+
+What the measurements showed, including the unflattering parts:
+
+- **The latency floor is the poll interval.** p99 equals `WORKER_POLL_INTERVAL`
+  (500 ms): an idle worker sleeps that long. Lowering it trades latency for
+  database load; `LISTEN/NOTIFY` would remove it.
+- **The ceiling is Postgres commit speed** (WAL fsync of the Docker volume,
+  about 2 ms each), not the worker: the database used 110 to 190 % CPU while
+  the worker stayed at 20 to 55 %, and adding workers did not raise throughput
+  here.
+- **The concurrency limit is shared by all endpoints.** With 10% of deliveries
+  going to endpoints that take 500 ms, 10 worker slots cap throughput near 180
+  deliveries/s, and at 400 offered the healthy endpoints' latency grew to
+  tens of seconds. Raising `WORKER_CONCURRENCY` to 50 fixed that load. There is
+  no per-endpoint isolation.
+- **About one run in five was 3 to 5 times slower** than its neighbours with
+  no failures or retries to explain it; I could not attribute it (the Docker
+  Desktop disk layer is the likeliest cause). The worst runs are reported in
+  [`docs/11-yuk-testi.md`](docs/11-yuk-testi.md), with the method, the
+  hypotheses I ruled out, and how to reproduce.
 
 ## Design decisions
 
@@ -533,7 +572,7 @@ Chosen limits and gaps, so nothing here is a surprise:
 - **Endpoint ports are not restricted**: a public IP on any port is allowed.
 - **Single database, no failover story**; the chaos test simulates crashing
   workers, not network partitions or a Postgres restart.
-- **No load testing**: no throughput or latency numbers are claimed.
+- **Load numbers are from one machine** (see [Performance](#performance)): no multi-host, long-running or real-network measurements.
 - **Interrupted attempts are free**: one the worker cuts short while stopping
   does not use up a retry, so a worker restarted mid-attempt over and over
   could retry a delivery indefinitely. A crash or `kill -9` still counts (as a
@@ -562,6 +601,7 @@ tried and what the tests found.
 | [`docs/08-son-inceleme.md`](docs/08-son-inceleme.md) | Final security and concurrency review: 16 findings, what changed, what the chaos test taught |
 | [`docs/09-saklama-suresi.md`](docs/09-saklama-suresi.md) | Retention: what is deleted, what never is, how it stays safe |
 | [`docs/10-sir-sifreleme.md`](docs/10-sir-sifreleme.md) | Encrypting the signing secrets at rest: design, migration, key replacement |
+| [`docs/11-yuk-testi.md`](docs/11-yuk-testi.md) | Load measurements: method, results, bottleneck analysis, what could not be explained |
 | [`api/openapi.yaml`](api/openapi.yaml) | The API contract |
 
 ## Roadmap
@@ -577,6 +617,9 @@ tried and what the tests found.
 | 6 | Integration, chaos and fuzz tests | done |
 | 7 | OpenAPI, documentation polish | done |
 | 8 | Final security and concurrency review | done |
+| 9 | Retention: expired deliveries and events are deleted | done |
+| 10 | Signing secrets encrypted at rest | done |
+| 11 | Load measurements | done |
 
 ## License
 
