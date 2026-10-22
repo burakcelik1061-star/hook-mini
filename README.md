@@ -759,4 +759,5 @@ tried and what the tests found.
 
 ## License
 
-MIT
+Copyright © 2026 Burak Çelik. All rights reserved. The code is published
+for reading and review; no license to use, copy or modify it is granted.
