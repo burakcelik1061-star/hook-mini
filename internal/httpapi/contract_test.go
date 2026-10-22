@@ -214,6 +214,7 @@ func TestHTTPResponsesMatchTheDocument(t *testing.T) {
 	k.do(c, "GET", "/v1/events", "/v1/events", 200, nil)
 	k.do(c, "GET", "/v1/events", "/v1/events?cursor=garbage", 400, nil)
 	k.do(c, "GET", "/v1/events/{id}", "/v1/events/"+evID, 200, nil)
+	k.do(c, "GET", "/v1/stats", "/v1/stats", 200, nil)
 
 	// ---- deliveries ----
 	list := k.do(c, "GET", "/v1/deliveries", "/v1/deliveries?event_id="+evID, 200, nil).JSON()

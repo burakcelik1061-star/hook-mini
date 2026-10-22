@@ -927,3 +927,84 @@ func TestDisableAndEnableEndpoint(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// The overview figures: the 24-hour window, the backlog of any age, every
+// endpoint (also one with no traffic), and nothing from another tenant.
+func TestStats(t *testing.T) {
+	s := newService(t)
+	a, b := newTenant(t, s), newTenant(t, s)
+	ep1, ep2 := newEndpoint(t, s, a.ID), newEndpoint(t, s, a.ID)
+	for range 3 {
+		if _, err := s.IngestEvent(ctx(), a.ID, IngestInput{Type: "a.b", Payload: json.RawMessage(`{}`)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	quiet := newEndpoint(t, s, a.ID) // created after the events: no deliveries
+	newEndpoint(t, s, b.ID)
+	if _, err := s.IngestEvent(ctx(), b.ID, IngestInput{Type: "a.b", Payload: json.RawMessage(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+
+	ids := func(ep uuid.UUID) []uuid.UUID {
+		t.Helper()
+		rows, err := testPool.Query(ctx(), `SELECT id FROM deliveries WHERE endpoint_id = $1 ORDER BY created_at, id`, ep)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		var out []uuid.UUID
+		for rows.Next() {
+			var id uuid.UUID
+			if err := rows.Scan(&id); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, id)
+		}
+		return out
+	}
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := testPool.Exec(ctx(), sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	finish := `UPDATE deliveries SET status = $2, attempt_count = 1, completed_at = now() WHERE id = $1`
+	lease := `UPDATE deliveries SET status = 'in_flight', locked_until = now() + interval '1 minute', locked_by = 'w', lease_token = gen_random_uuid() WHERE id = $1`
+	old := `UPDATE deliveries SET created_at = now() - interval '2 days' WHERE id = $1`
+
+	d1, d2 := ids(ep1.ID), ids(ep2.ID)
+	exec(finish, d1[0], "succeeded")
+	exec(finish, d1[1], "dead")
+	// d1[2] stays pending
+	exec(lease, d2[0])
+	exec(old, d2[1]) // pending, but two days old: backlog only
+	exec(finish, d2[2], "succeeded")
+	exec(old, d2[2]) // succeeded two days ago: in neither figure
+
+	st, err := s.Stats(ctx(), a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (StatusCounts{Succeeded: 1, Dead: 1, Pending: 1, InFlight: 1}); st.Last24h != want {
+		t.Errorf("last 24 h = %+v, want %+v", st.Last24h, want)
+	}
+	if st.Backlog.Pending != 2 || st.Backlog.InFlight != 1 {
+		t.Errorf("backlog = %+v, want 2 pending (one of them old) and 1 in flight", st.Backlog)
+	}
+	got := map[uuid.UUID]StatusCounts{}
+	for _, e := range st.Endpoints {
+		got[e.ID] = e.Last24h
+	}
+	if len(st.Endpoints) != 3 {
+		t.Fatalf("%d endpoints, want the tenant's 3 and no other tenant's", len(st.Endpoints))
+	}
+	if want := (StatusCounts{Succeeded: 1, Dead: 1, Pending: 1}); got[ep1.ID] != want {
+		t.Errorf("endpoint 1 = %+v, want %+v", got[ep1.ID], want)
+	}
+	if want := (StatusCounts{InFlight: 1}); got[ep2.ID] != want {
+		t.Errorf("endpoint 2 = %+v, want %+v", got[ep2.ID], want)
+	}
+	if c, ok := got[quiet.ID]; !ok || c != (StatusCounts{}) {
+		t.Errorf("an endpoint without deliveries: present=%v counts=%+v, want present with zeros", ok, c)
+	}
+}

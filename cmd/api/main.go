@@ -16,6 +16,7 @@ import (
 	"github.com/burakcelik1061-star/hook-mini/internal/ratelimit"
 	"github.com/burakcelik1061-star/hook-mini/internal/safedial"
 	"github.com/burakcelik1061-star/hook-mini/internal/service"
+	"github.com/burakcelik1061-star/hook-mini/internal/webui"
 )
 
 func main() {
@@ -70,7 +71,7 @@ func run() error {
 		return fmt.Errorf("listen on %s: %w", cfg.HTTPAddr, err)
 	}
 	srv := &http.Server{
-		Handler:           httpapi.NewRouter(httpapi.Deps{Log: log, DB: pool, Svc: svc, Limiter: limiter}),
+		Handler:           httpapi.NewRouter(httpapi.Deps{Log: log, DB: pool, Svc: svc, Limiter: limiter, UI: webui.Handler()}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,

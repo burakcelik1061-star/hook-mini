@@ -46,6 +46,8 @@ tags:
     description: What your application sends.
   - name: Deliveries
     description: Delivery history, with every attempt, and replay.
+  - name: Stats
+    description: Figures for an overview of the tenant's traffic.
   - name: Operations
     description: Health and this document.
 
@@ -279,6 +281,26 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "429": { $ref: "#/components/responses/TooManyRequests" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /v1/stats:
+    get:
+      tags: [Stats]
+      operationId: getStats
+      summary: Delivery figures for the tenant
+      description: |
+        Deliveries created in the last 24 hours by the status they have now,
+        the backlog of unfinished deliveries (however old), and each
+        endpoint's 24-hour figures. All read in one consistent snapshot.
+      responses:
+        "200":
+          description: The figures.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Stats"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/TooManyRequests" }
         "500": { $ref: "#/components/responses/InternalError" }
 
   /v1/events:
@@ -790,6 +812,53 @@ components:
           items: { $ref: "#/components/schemas/Event" }
         next_cursor:
           type: [string, "null"]
+
+    StatusCounts:
+      type: object
+      additionalProperties: false
+      required: [succeeded, dead, pending, in_flight]
+      properties:
+        succeeded: { type: integer, minimum: 0 }
+        dead: { type: integer, minimum: 0 }
+        pending: { type: integer, minimum: 0 }
+        in_flight: { type: integer, minimum: 0 }
+
+    Stats:
+      type: object
+      additionalProperties: false
+      required: [last_24h, backlog, endpoints]
+      properties:
+        last_24h:
+          $ref: "#/components/schemas/StatusCounts"
+        backlog:
+          type: object
+          additionalProperties: false
+          required: [pending, in_flight]
+          properties:
+            pending: { type: integer, minimum: 0 }
+            in_flight: { type: integer, minimum: 0 }
+        endpoints:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, url, status, consecutive_failures, last_24h]
+            properties:
+              id: { type: string, format: uuid }
+              url: { type: string }
+              status: { type: string, enum: [active, disabled] }
+              consecutive_failures: { type: integer, minimum: 0 }
+              last_24h:
+                $ref: "#/components/schemas/StatusCounts"
+      example:
+        last_24h: { succeeded: 1204, dead: 3, pending: 7, in_flight: 2 }
+        backlog: { pending: 9, in_flight: 2 }
+        endpoints:
+          - id: 0b5f1a8e-6a1c-4b6e-9c55-2b8f2c1d7e01
+            url: https://billing.example.com/hooks
+            status: active
+            consecutive_failures: 0
+            last_24h: { succeeded: 1204, dead: 3, pending: 7, in_flight: 2 }
 
     DeliveryStatus:
       type: string

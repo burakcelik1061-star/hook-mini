@@ -15,6 +15,7 @@ import (
 	"github.com/burakcelik1061-star/hook-mini/api"
 	"github.com/burakcelik1061-star/hook-mini/internal/ratelimit"
 	"github.com/burakcelik1061-star/hook-mini/internal/service"
+	"github.com/burakcelik1061-star/hook-mini/internal/webui"
 )
 
 // Pinger is the one thing the HTTP layer needs from the database: proof that
@@ -33,6 +34,9 @@ type Deps struct {
 	Svc *service.Service
 	// Limiter caps each tenant's request rate on /v1. Nil means no limit.
 	Limiter *ratelimit.Limiter
+	// UI serves the web console on its own routes (webui.Routes and the
+	// asset prefix). Nil means no console.
+	UI http.Handler
 }
 
 // NewRouter returns the root handler.
@@ -54,6 +58,13 @@ func NewRouter(d Deps) http.Handler {
 	r.Get("/readyz", readyz(d.Log, d.DB))
 	r.Get("/openapi.yaml", openAPI)
 
+	if d.UI != nil {
+		for _, p := range webui.Routes {
+			r.Get(p, d.UI.ServeHTTP)
+		}
+		r.Get(webui.AssetPrefix+"*", d.UI.ServeHTTP)
+	}
+
 	if d.Svc != nil {
 		h := &handlers{svc: d.Svc, log: d.Log, limiter: d.Limiter}
 		r.Route("/v1", func(r chi.Router) {
@@ -74,6 +85,7 @@ func NewRouter(d Deps) http.Handler {
 				r.Get("/{id}", h.getDelivery)
 				r.Post("/{id}/replay", h.replayDelivery)
 			})
+			r.Get("/stats", h.stats)
 			r.Route("/events", func(r chi.Router) {
 				r.Post("/", h.createEvent)
 				r.Get("/", h.listEvents)

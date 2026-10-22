@@ -445,3 +445,50 @@ func (h *handlers) getEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, newEventResponse(res.Event, &res.DeliveryCount))
 }
+
+type statusCountsResponse struct {
+	Succeeded int64 `json:"succeeded"`
+	Dead      int64 `json:"dead"`
+	Pending   int64 `json:"pending"`
+	InFlight  int64 `json:"in_flight"`
+}
+
+func newStatusCounts(c service.StatusCounts) statusCountsResponse {
+	return statusCountsResponse{Succeeded: c.Succeeded, Dead: c.Dead, Pending: c.Pending, InFlight: c.InFlight}
+}
+
+type endpointStatsResponse struct {
+	ID                  uuid.UUID            `json:"id"`
+	URL                 string               `json:"url"`
+	Status              string               `json:"status"`
+	ConsecutiveFailures int32                `json:"consecutive_failures"`
+	Last24h             statusCountsResponse `json:"last_24h"`
+}
+
+type statsResponse struct {
+	Last24h statusCountsResponse `json:"last_24h"`
+	Backlog struct {
+		Pending  int64 `json:"pending"`
+		InFlight int64 `json:"in_flight"`
+	} `json:"backlog"`
+	Endpoints []endpointStatsResponse `json:"endpoints"`
+}
+
+// stats serves the tenant's overview figures.
+func (h *handlers) stats(w http.ResponseWriter, r *http.Request) {
+	st, err := h.svc.Stats(r.Context(), principalFrom(r.Context()).TenantID)
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+	var res statsResponse
+	res.Last24h = newStatusCounts(st.Last24h)
+	res.Backlog.Pending, res.Backlog.InFlight = st.Backlog.Pending, st.Backlog.InFlight
+	res.Endpoints = make([]endpointStatsResponse, 0, len(st.Endpoints))
+	for _, e := range st.Endpoints {
+		res.Endpoints = append(res.Endpoints, endpointStatsResponse{
+			ID: e.ID, URL: e.URL, Status: e.Status, ConsecutiveFailures: e.ConsecutiveFailures, Last24h: newStatusCounts(e.Last24h),
+		})
+	}
+	writeJSON(w, http.StatusOK, res)
+}

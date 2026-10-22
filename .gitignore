@@ -5,3 +5,10 @@
 coverage.out
 .idea/
 .vscode/
+
+# The console's build: produced by npm run build in web/, embedded by
+# internal/webui. Only the placeholder that keeps the embed valid is kept.
+internal/webui/dist/*
+!internal/webui/dist/.gitkeep
+web/node_modules/
+web/*.tsbuildinfo

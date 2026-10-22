@@ -3,3 +3,6 @@
 .env
 docs
 *.md
+# The console is built inside the image; never copy a host build or modules.
+web/node_modules
+internal/webui/dist

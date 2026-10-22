@@ -212,3 +212,30 @@ func TestUnknownRouteIs404(t *testing.T) {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
 }
+
+// With a console, its routes serve it, and everything else is untouched:
+// the API, the health checks, and an unknown path is still a JSON 404.
+func TestConsoleRoutesDoNotShadowTheAPI(t *testing.T) {
+	ui := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "console") })
+	h := NewRouter(Deps{Log: slog.New(slog.NewTextHandler(io.Discard, nil)), DB: fakeDB{}, UI: ui})
+	for _, p := range []string{"/", "/endpoints", "/deliveries", "/send", "/sign-in", "/assets/app.js"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, p, nil))
+		if rec.Body.String() != "console" {
+			t.Errorf("%s: %q, want the console", p, rec.Body.String())
+		}
+	}
+	for p, want := range map[string]int{"/healthz": 200, "/nope": 404, "/v1": 404} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, p, nil))
+		if rec.Code != want || rec.Body.String() == "console" {
+			t.Errorf("%s: %d %q, want %d from the API router", p, rec.Code, rec.Body.String(), want)
+		}
+	}
+	// A POST to a console path is not the console's.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/endpoints", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /endpoints: %d, want 405", rec.Code)
+	}
+}

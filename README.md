@@ -12,14 +12,17 @@ history. Think Svix, scaled down to something you can read in an afternoon.
   `FOR UPDATE SKIP LOCKED`. Run as many workers as you like.
 - **Built to be tested hard**: chaos, contention and fuzz tests, and an OpenAPI
   document that the tests check against the real server.
+- **A web console** in the same binary: watch deliveries move live, inspect
+  every attempt, replay, manage endpoints and send test events.
 
-> **Status: Phase 7 of 8 (documentation).** Everything described here exists and
-> is tested; the final security and concurrency review (Phase 8) is still to
-> do, and CI has not run yet (see [Known limits](#known-limits)).
+> **Status: Phase 13 of 14 (web console).** Everything described here exists and
+> is tested; the final review and publishing (Phase 14) are still to do, and CI
+> has not run yet (see [Known limits](#known-limits)).
 
 **Contents:**
 [Quick start](#quick-start) ·
 [API](#api) ·
+[Web console](#web-console) ·
 [Architecture](#architecture) ·
 [Delivery](#delivery) ·
 [Security](#security) ·
@@ -52,6 +55,9 @@ docker compose run --rm api admin bootstrap "Acme Inc"
 ```bash
 export KEY=hm_...   # the api_key from the output above
 ```
+
+Open <http://localhost:8080> and sign in with that key to use the
+[web console](#web-console), or carry on with curl.
 
 Register an endpoint (the response contains its signing secret, **once**):
 
@@ -127,7 +133,9 @@ All `/v1` routes need `Authorization: Bearer <api key>`. Bodies are JSON.
 | `GET /v1/deliveries` | List deliveries; filter by `endpoint_id`, `event_id`, `status`. |
 | `GET /v1/deliveries/{id}` | One delivery with all its attempts. |
 | `POST /v1/deliveries/{id}/replay` | Send a dead or succeeded delivery again. `202`. |
+| `GET /v1/stats` | Delivery counts by status for the last 24 hours, the current backlog, and the same per endpoint (with its consecutive failures). One consistent snapshot. |
 | `GET /healthz`, `GET /readyz`, `GET /openapi.yaml` | Liveness, readiness (checks the database), this document. No key needed. |
+| `GET /` (and `/endpoints`, `/deliveries`, `/send`, `/sign-in`, `/assets/*`) | The [web console](#web-console). Not part of the API contract. |
 
 **Idempotency.** With an `Idempotency-Key` header, the same key and the same
 content returns the original event (`200`, `Idempotent-Replayed: true`) and
@@ -155,6 +163,54 @@ from `next_cursor`, which is `null` on the last page).
 | 415 | `unsupported_media_type` |
 | 422 | `idempotency_key_reuse` |
 | 500 | `internal_error` (details are logged with the `request_id`, never returned) |
+
+## Web console
+
+The api serves a console at `/`: a React and TypeScript single-page app in
+[`web/`](web), built by Vite and embedded into the api binary with `go:embed`,
+so there is nothing extra to deploy. It uses only the public `/v1` API with
+the tenant's key, exactly as any client would.
+
+| Screen | What it does |
+| --- | --- |
+| **Overview** | Last 24 hours and the backlog (from `GET /v1/stats`), a live 3D pipeline where each delivery that finishes, fails or dies flies to its endpoint's lane, dead deliveries and disabled endpoints with one-click replay or enable, and per-endpoint success rates. |
+| **Endpoints** | Create, rotate, disable, enable and delete. A signing secret is shown once, after creation or rotation, and never again. |
+| **Deliveries** | Filter by status and endpoint (kept in the URL, so a view can be shared); each delivery's full attempt timeline, telling endpoint failures from the worker's own interruptions and lost leases; replay. |
+| **Send event** | Validates type, payload and `Idempotency-Key` before sending, then follows the event's deliveries as they fan out. Sending twice with one key shows the idempotent replay. Also prints the same request as `curl`. |
+
+Live views poll the API (every 1 to 30 s, paused while the tab is hidden);
+the request budget meter in the header comes from the `RateLimit-*` headers.
+The layout works down to phone width, and `prefers-reduced-motion` turns the
+animations off.
+
+**Security.** The key is kept in `sessionStorage` (gone when the tab closes),
+or in `localStorage` only when the user ticks "remember". It is sent only as
+a Bearer header, never in a URL; requests carry no cookies, so there is no
+session to forge (no CSRF). A rejected key (`401`) signs the console out at
+once. Every console response has a strict policy, with no inline script,
+style or font and nothing from another origin:
+
+```text
+default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:;
+font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none';
+form-action 'self'; object-src 'none'
+```
+
+plus `X-Frame-Options: DENY`, `nosniff` and `Referrer-Policy: no-referrer`.
+The fonts (Geist) are bundled, not loaded from a CDN. Hashed assets are cached
+for a year; the app shell is revalidated on every load.
+
+**Building.** `docker compose up --build` builds the console in a Node stage
+of the Dockerfile. Without Docker:
+
+```bash
+cd web && npm ci && npm run build   # writes internal/webui/dist
+go build ./cmd/api                  # embeds it
+```
+
+A Go build without that step still works; `/` then explains how to build the
+console. For development, `npm run dev` serves it on <http://localhost:5173>
+with hot reload and forwards `/v1` to an api on `:8080`.
 
 ## Architecture
 
@@ -188,7 +244,8 @@ Code layout: `cmd/` (binaries), `internal/httpapi` (HTTP only),
 `internal/service` (business rules), `internal/store` (generated by sqlc),
 `internal/delivery` (the worker), `internal/safedial` (SSRF policy),
 `pkg/webhook` (signing and verification, importable by receivers),
-`db/migrations` and `db/queries` (plain SQL), `api/` (OpenAPI).
+`db/migrations` and `db/queries` (plain SQL), `api/` (OpenAPI),
+`web/` (the console's source) and `internal/webui` (serves its build).
 
 ### Data model
 
@@ -493,6 +550,15 @@ pick up the deliveries tests create (their URLs use the reserved
 `winget install BrechtSanders.WinLibs.POSIX.UCRT` and `CGO_ENABLED=1`). CI
 runs it on every push.
 
+The console has its own unit tests (Vitest): the API client (headers, errors,
+`Retry-After`, the rate-limit budget, sign-out on `401`), where the key is
+stored, formatting, and which delivery changes become packets in the live
+pipeline.
+
+```bash
+cd web && npm ci && npm run typecheck && npm test
+```
+
 ### What is tested beyond the unit tests
 
 | Kind | Where | What it proves |
@@ -607,6 +673,16 @@ Chosen limits and gaps, so nothing here is a surprise:
   does not use up a retry, so a worker restarted mid-attempt over and over
   could retry a delivery indefinitely. A crash or `kill -9` still counts (as a
   lost lease).
+- **The console is a thin client, sized for tens of endpoints.** It joins data
+  in the browser (event types for the deliveries on screen; endpoint names
+  from the first 100 endpoints on Deliveries and Send event, 500 on the
+  Endpoints page) and polls instead of streaming. The live views draw at most
+  six endpoints. `GET /v1/stats` returns every endpoint of the tenant in one
+  response, without pagination. Its numbers are counts, not latencies:
+  there is no p99 or other timing metric yet, and a replayed delivery's
+  "round" is not shown, only its numbered attempts. Remembering the key keeps
+  it in `localStorage`, readable by any script on the origin; the strict
+  content policy above is what makes that an acceptable opt-in.
 - **A tenant can tell whether a host name resolves** and to what kind of
   address (`blocked: ... (private network)`), though never the address itself.
 - **Platform**: developed and tested on Windows with Docker; **CI has not run
@@ -633,6 +709,7 @@ tried and what the tests found.
 | [`docs/10-sir-sifreleme.md`](docs/10-sir-sifreleme.md) | Encrypting the signing secrets at rest: design, migration, key replacement |
 | [`docs/11-yuk-testi.md`](docs/11-yuk-testi.md) | Load measurements: method, results, bottleneck analysis, what could not be explained |
 | [`docs/12-hiz-siniri-ve-adalet.md`](docs/12-hiz-siniri-ve-adalet.md) | Per-tenant rate limit, per-endpoint maximum, and the bugs the measurements found |
+| [`docs/13-arayuz.md`](docs/13-arayuz.md) | The web console: design, security, how it is served and tested, what the browser test found |
 | [`api/openapi.yaml`](api/openapi.yaml) | The API contract |
 
 ## Roadmap
@@ -652,6 +729,8 @@ tried and what the tests found.
 | 10 | Signing secrets encrypted at rest | done |
 | 11 | Load measurements | done |
 | 12 | Per-tenant rate limit, per-endpoint concurrency maximum | done |
+| 13 | Web console and `GET /v1/stats` | done |
+| 14 | Final review, screenshots, CI run, publishing | next |
 
 ## License
 

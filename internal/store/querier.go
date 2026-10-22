@@ -103,12 +103,22 @@ type Querier interface {
 	DeleteExpiredEvents(ctx context.Context, arg DeleteExpiredEventsParams) (int64, error)
 	// Cascades to keys, endpoints, events, deliveries and attempts.
 	DeleteTenant(ctx context.Context, id uuid.UUID) (int64, error)
+	// Unfinished deliveries, however old.
+	DeliveryBacklog(ctx context.Context, tenantID uuid.UUID) (DeliveryBacklogRow, error)
+	// Tenant statistics for the console's overview. Each query is scoped to one
+	// tenant and bounded: the 24-hour figures use deliveries_tenant_idx
+	// (tenant_id, created_at), the backlog only looks at unfinished deliveries.
+	// Deliveries created in the last 24 hours, by their status now.
+	DeliveryCountsLast24h(ctx context.Context, tenantID uuid.UUID) ([]DeliveryCountsLast24hRow, error)
 	// Idempotent: only an active endpoint is changed, so the first reason sticks.
 	DisableEndpoint(ctx context.Context, arg DisableEndpointParams) (int64, error)
 	// The tenant-scoped, manual counterpart of DisableEndpoint. Returns no row
 	// when the endpoint is already disabled or does not exist for the tenant.
 	DisableEndpointForTenant(ctx context.Context, arg DisableEndpointForTenantParams) (Endpoint, error)
 	EnableEndpoint(ctx context.Context, arg EnableEndpointParams) (Endpoint, error)
+	// Every endpoint of the tenant with its deliveries of the last 24 hours by
+	// status (zeros for an endpoint without any), oldest endpoint first.
+	EndpointStatsLast24h(ctx context.Context, tenantID uuid.UUID) ([]EndpointStatsLast24hRow, error)
 	// Authentication path: look the key up by its public prefix, then the caller
 	// compares key_hash in constant time. Revoked keys are never returned.
 	GetActiveAPIKeyByPrefix(ctx context.Context, prefix string) (ApiKey, error)
